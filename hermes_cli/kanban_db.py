@@ -811,9 +811,8 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
 def board_metadata_path(board: Optional[str] = None) -> Path:
     """Return the path to ``board.json`` for ``board``.
 
-    Stores display metadata (display name, description, icon, color,
-    created_at). The on-disk slug is the canonical identity; this file
-    is purely for presentation in the CLI / dashboard.
+    Stores display metadata and optional board-owned settings. The on-disk
+    slug remains the canonical identity.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     return board_dir(slug) / "board.json"
@@ -829,11 +828,14 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
-def read_board_metadata(board: Optional[str] = None) -> dict:
+def read_board_metadata(
+    board: Optional[str] = None, *, strict: bool = False,
+    metadata_path: Optional[Path] = None,
+) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
-    Never raises — a missing / malformed ``board.json`` falls back to a
-    synthesised entry so the dashboard always has something to render.
+    Display reads fall back to defaults; strict policy reads propagate malformed
+    or unreadable metadata. A missing file still means an unconfigured board.
     Includes the canonical ``slug`` and ``db_path`` so the caller
     doesn't need to reconstruct them.
     """
@@ -854,16 +856,18 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "archived": False,
     }
     try:
-        p = board_metadata_path(slug)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                # Never let the metadata file claim a different slug than
-                # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
+        p = metadata_path if metadata_path is not None else board_metadata_path(slug)
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("board metadata must be an object")
+        # Never let the metadata file claim a different filesystem identity.
+        raw["slug"] = slug
+        meta.update(raw)
+    except FileNotFoundError:
         pass
+    except (OSError, ValueError, UnicodeError):
+        if strict:
+            raise
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -878,6 +882,8 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    pre_claim: Optional[dict] = None,
+    clear_pre_claim: bool = False,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -894,6 +900,12 @@ def write_board_metadata(
     # Preserve existing DB-derived fields — they get re-computed each
     # read but shouldn't be written into board.json.
     meta.pop("db_path", None)
+    if clear_pre_claim:
+        meta.pop("pre_claim", None)
+    elif pre_claim is not None:
+        from hermes_cli.kanban_db_policy import validate_policy
+
+        meta["pre_claim"] = validate_policy(pre_claim)
     if name is not None:
         meta["name"] = str(name).strip() or _default_board_display_name(slug)
     if description is not None:
@@ -1680,8 +1692,11 @@ def _cross_process_init_lock(path: Path):
             handle.close()
 
 
+_DISPATCH_HELD = threading.local()
+
+
 @contextlib.contextmanager
-def _dispatch_tick_lock(db_path: Path):
+def _dispatch_tick_lock(db_path: Path, *, reentrant: bool = False, required: bool = False):
     """Non-blocking single-writer guard around one dispatcher tick.
 
     Yields ``True`` when this process holds the board's dispatch lock and
@@ -1706,11 +1721,19 @@ def _dispatch_tick_lock(db_path: Path):
     again next interval.
 
     Board-scoped: the lock file is a ``.dispatch.lock`` sibling of the
-    board's ``kanban.db``, so unrelated boards tick independently. On
-    platforms without ``fcntl``/``msvcrt`` the guard degrades to a no-op
-    (yields ``True``) — single-writer enforcement is best-effort and the
-    orphan-dispatcher scenario is specific to POSIX service managers.
+    board's ``kanban.db``, so unrelated boards tick independently.
+    Internal policy calls may join only this thread's actual same-process owner
+    FD. Ordinary nested ticks remain contenders. ``required`` makes lock-file
+    open errors fail closed for opted-in boards; legacy callers retain fallback.
     """
+    db_path = db_path.resolve()
+    owners = getattr(_DISPATCH_HELD, "owners", None)
+    if owners is None:
+        owners = _DISPATCH_HELD.owners = {}
+    owner = owners.get(db_path)
+    if reentrant and owner and owner[0] == os.getpid() and not owner[1].closed:
+        yield True
+        return
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
     acquired = False
@@ -1739,15 +1762,18 @@ def _dispatch_tick_lock(db_path: Path):
                 acquired = False
     except OSError:
         # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # Only legacy callers may degrade to a no-op on an open failure.
+        acquired = not required
         handle = None
+    if acquired and handle is not None:
+        owners[db_path] = (os.getpid(), handle)
     try:
         yield acquired
     finally:
         if handle is not None:
             try:
                 if acquired:
+                    owners.pop(db_path, None)
                     if _IS_WINDOWS:
                         import msvcrt
 
@@ -2328,6 +2354,7 @@ def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    read_only: bool = False,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
@@ -2351,6 +2378,18 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    if read_only:
+        from hermes_cli.sqlite_safe_read import connect_tracked
+
+        conn = connect_tracked(
+            path.resolve().as_uri() + "?mode=ro", connect_fn=sqlite3.connect,
+            uri=True, isolation_level=None, timeout=_resolve_busy_timeout_ms() / 1000.0,
+        )
+        conn.row_factory = sqlite3.Row
+        if not _schema_is_present(conn):
+            conn.close()
+            raise PermissionError("read-only kanban access requires an initialized board")
+        return conn
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2468,6 +2507,7 @@ def connect_closing(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    read_only: bool = False,
 ):
     """Open a kanban DB connection and guarantee it is closed on exit.
 
@@ -2488,7 +2528,7 @@ def connect_closing(
     intentionally manage the connection lifetime (tests, long-lived
     callers) continue to work.
     """
-    conn = connect(db_path=db_path, board=board)
+    conn = connect(db_path=db_path, board=board, read_only=read_only)
     try:
         yield conn
     finally:
@@ -4547,6 +4587,11 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    from hermes_cli import kanban_db_policy
+
+    policy = kanban_db_policy.board_policy(conn)
+    if policy is not None:
+        return kanban_db_policy.recompute_ready(conn, policy, failure_limit)
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -4632,10 +4677,14 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
-    now = int(time.time())
+    from hermes_cli.kanban_db_policy import policy_transaction
+
     lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    with policy_transaction(conn, task_id, "ready") as allowed:
+        if not allowed:
+            return None
+        now = int(time.time())
+        expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4760,10 +4809,14 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
-    now = int(time.time())
+    from hermes_cli.kanban_db_policy import policy_transaction
+
     lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    with policy_transaction(conn, task_id, "review") as allowed:
+        if not allowed:
+            return None
+        now = int(time.time())
+        expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -9901,8 +9954,11 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    from hermes_cli.kanban_db_policy import board_policy
+
+    policy = board_policy(conn)
     try:
-        db_path = kanban_db_path(board=board)
+        db_path = policy.db_path if policy is not None else kanban_db_path(board=board)
     except Exception:
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
@@ -9923,7 +9979,7 @@ def dispatch_once(
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
-    with _dispatch_tick_lock(db_path) as held:
+    with _dispatch_tick_lock(db_path, required=policy is not None) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
@@ -9944,7 +10000,8 @@ def dispatch_once(
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
-            _maybe_checkpoint_wal(conn, db_path)
+            if not (dry_run and policy is not None):
+                _maybe_checkpoint_wal(conn, db_path)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
@@ -10008,34 +10065,37 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
-    if reconcile_orphans:
-        # Orphaned-card reconciliation: requeue 'running' cards whose claim
-        # bookkeeping is broken (no valid claim, dead/gone worker) that the
-        # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
-        result.reconciled_orphans = reconcile_orphaned_running(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
-    if _crash_auto_blocked:
-        result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    from hermes_cli.kanban_db_policy import board_policy
+
+    if not (dry_run and board_policy(conn) is not None):
+        result.reclaimed = release_stale_claims(conn)
+        if reconcile_orphans:
+            # Orphaned-card reconciliation: requeue 'running' cards whose claim
+            # bookkeeping is broken (no valid claim, dead/gone worker) that the
+            # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
+            result.reconciled_orphans = reconcile_orphaned_running(conn)
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
+        # detect_crashed_workers stashes protocol-violation auto-blocks on
+        # itself so the public list-return stays stable. Pull them into the
+        # DispatchResult here so telemetry / tests see the trip.
+        _crash_auto_blocked = getattr(
+            detect_crashed_workers, "_last_auto_blocked", []
+        )
+        if _crash_auto_blocked:
+            result.auto_blocked.extend(_crash_auto_blocked)
+        # Rate-limited requeues (quota wall, no failure counted) — surface for
+        # telemetry / tests. These tasks went back to ``ready`` and the respawn
+        # guard will defer them until the quota window clears.
+        _crash_rate_limited = getattr(
+            detect_crashed_workers, "_last_rate_limited", []
+        )
+        if _crash_rate_limited:
+            result.rate_limited.extend(_crash_rate_limited)
+        result.timed_out = enforce_max_runtime(conn)
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full

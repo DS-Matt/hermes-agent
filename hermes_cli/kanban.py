@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -70,6 +71,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "branch_name": t.branch_name,
         "project_id": t.project_id,
         "created_by": t.created_by,
+        "idempotency_key": t.idempotency_key,
         "created_at": t.created_at,
         "started_at": t.started_at,
         "completed_at": t.completed_at,
@@ -326,6 +328,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    b_policy = boards_sub.add_parser(
+        "set-pre-claim", help="Set or clear the board's optional pre-claim policy",
+    )
+    b_policy.add_argument("--timeout", type=float, default=10)
+    b_policy.add_argument("--clear", action="store_true")
+    b_policy.add_argument("--json", action="store_true")
+    b_policy.add_argument("slug")
+    b_policy.add_argument("policy_command", nargs=argparse.REMAINDER)
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -436,6 +447,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_list.add_argument("--archived", action="store_true",
                         help="Include archived tasks")
     p_list.add_argument("--json", action="store_true")
+    p_list.add_argument("--no-promote", action="store_true",
+                        help="Read-only snapshot without initialization or promotion")
     p_list.add_argument(
         "--sort",
         default=None,
@@ -460,6 +473,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
     p_show.add_argument("--json", action="store_true")
+    p_show.add_argument("--read-only", action="store_true",
+                        help="Observe an initialized board without initialization writes")
     p_show.add_argument(
         "--state-type",
         choices=("status", "outcome"),
@@ -1100,7 +1115,11 @@ def kanban_command(args: argparse.Namespace) -> int:
         if action == "repair":
             return _cmd_repair(args)
         try:
-            kb.init_db()
+            observational = (
+                action in {"list", "ls"} and getattr(args, "no_promote", False)
+            ) or (action == "show" and getattr(args, "read_only", False))
+            if not observational:
+                kb.init_db()
         except Exception as exc:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
@@ -1158,7 +1177,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 2
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, PermissionError, sqlite3.OperationalError) as exc:
+            if isinstance(exc, (PermissionError, sqlite3.OperationalError)) and not observational:
+                raise
             print(f"kanban: {exc}", file=sys.stderr)
             return 1
 
@@ -1221,6 +1242,7 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "use",
     "rename",
     "set-default-workdir",
+    "set-pre-claim",
 })
 
 
@@ -1268,6 +1290,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "set-pre-claim":
+        return _cmd_boards_set_pre_claim(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1421,6 +1445,40 @@ def _cmd_boards_rename(args: argparse.Namespace) -> int:
         return 1
     meta = kb.write_board_metadata(normed, name=args.name)
     print(f"Board {normed!r} renamed to {meta['name']!r}.")
+    return 0
+
+
+def _cmd_boards_set_pre_claim(args: argparse.Namespace) -> int:
+    try:
+        slug = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards set-pre-claim: {exc}", file=sys.stderr)
+        return 2
+    if not slug or not kb.board_exists(slug):
+        print(f"kanban boards set-pre-claim: board {args.slug!r} does not exist", file=sys.stderr)
+        return 1
+    native = kb.kanban_home() / "kanban.db" if slug == kb.DEFAULT_BOARD else kb.board_dir(slug) / "kanban.db"
+    if kb.kanban_db_path(slug).resolve() != native.resolve():
+        print("kanban boards set-pre-claim requires the canonical native board DB", file=sys.stderr)
+        return 2
+    command = args.policy_command
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if args.clear and command:
+        print("kanban boards set-pre-claim: --clear cannot include a command", file=sys.stderr)
+        return 2
+    try:
+        meta = kb.write_board_metadata(
+            slug, clear_pre_claim=args.clear,
+            pre_claim=None if args.clear else {"command": command, "timeout_seconds": args.timeout},
+        )
+    except ValueError as exc:
+        print(f"kanban boards set-pre-claim: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(meta, indent=2, ensure_ascii=False))
+    else:
+        print(f"Board {slug!r} pre-claim policy {'cleared' if args.clear else 'configured'}.")
     return 0
 
 
@@ -1642,10 +1700,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect_closing() as conn:
+    no_promote = getattr(args, "no_promote", False)
+    with kb.connect_closing(read_only=no_promote) as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        if not no_promote:
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
@@ -1692,7 +1752,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         return 2
     graph = None
-    with kb.connect_closing() as conn:
+    with kb.connect_closing(read_only=getattr(args, "read_only", False)) as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -1721,6 +1781,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             ],
             "events": [
                 {
+                    "id": e.id,
                     "kind": e.kind,
                     "payload": e.payload,
                     "created_at": e.created_at,
