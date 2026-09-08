@@ -3999,8 +3999,14 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": author, "len": len(body), "comment_id": comment_id},
+        )
+        return comment_id
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -9386,6 +9392,53 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+# Only explicit native lifecycle continuation events may override an active-PR
+# signal. Automatic recovery and generic status events must not defeat
+# duplicate-PR protection.
+_ACTIVE_PR_CONTINUATION_EVENT_KINDS = (
+    "promoted_manual",
+    "unblocked",
+    "changes_requested",
+    "review_reopened",
+)
+
+
+def _comment_event_id(
+    conn: sqlite3.Connection, task_id: str, comment_id: int
+) -> Optional[int]:
+    """Return the event-stream position bound to ``comment_id``, if any.
+
+    Current comments carry their row id in the adjacent ``commented`` event,
+    making event ids authoritative across the two tables. Legacy/unbound
+    comments intentionally return ``None`` and remain guarded.
+    """
+    rows = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'commented' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if payload.get("comment_id") == comment_id:
+            return int(row["id"])
+    return None
+
+
+def _has_active_pr_continuation_after(
+    conn: sqlite3.Connection, task_id: str, event_id: int
+) -> bool:
+    """Return whether an allowlisted continuation follows ``event_id``."""
+    placeholders = ", ".join("?" for _ in _ACTIVE_PR_CONTINUATION_EVENT_KINDS)
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        f"AND kind IN ({placeholders}) LIMIT 1",
+        (task_id, event_id, *_ACTIVE_PR_CONTINUATION_EVENT_KINDS),
+    ).fetchone() is not None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9438,6 +9491,9 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed only when an explicit native lifecycle continuation event
+        arrives after the newest PR-URL comment. A newer PR comment re-arms the
+        guard. Legacy comments without an event-id binding remain guarded.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9528,10 +9584,20 @@ def check_respawn_guard(
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT id, body FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            comment_event_id = _comment_event_id(conn, task_id, int(c["id"]))
+            if (
+                comment_event_id is not None
+                and _has_active_pr_continuation_after(
+                    conn, task_id, comment_event_id
+                )
+            ):
+                return None
             return "active_pr"
 
     return None
