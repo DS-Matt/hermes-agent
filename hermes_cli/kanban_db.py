@@ -3126,9 +3126,9 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
-    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
-    promote it into a context-free respawn. ``transient`` still counts
+    :func:`_route_block`). ``kind='dependency'`` with no incomplete or newly
+    completed parent is re-kinded to ``needs_input`` (sticky), preventing
+    context-free respawns. ``transient`` still counts
     toward the loop breaker so a forever-flaky task escalates. True on any
     transition.
 
@@ -3172,11 +3172,11 @@ def block_task(
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
         rekind_reason = None
-        # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
+        from hermes_cli.kanban_db_graph import parent_completed_during_claim
+        # A parent finishing during this claim supplies new context for one
+        # native retry; old terminal parents still cannot cause a respawn loop.
+        if (kind == "dependency" and _parents_satisfied(conn, task_id)
+                and not parent_completed_during_claim(conn, task_id)):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
         prev_recurrences = int(_row_get(cur_row, "block_recurrences") or 0)
@@ -3295,7 +3295,7 @@ def _route_block(
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
     as something to "unblock". Callers that pass ``dependency`` with no
-    incomplete parent are re-kinded to ``needs_input`` before this runs
+    incomplete or newly completed parent are re-kinded to ``needs_input``
     (see :func:`block_task`). Every other kind counts unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
