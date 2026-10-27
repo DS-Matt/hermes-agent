@@ -13,6 +13,12 @@ export interface KanbanTask {
   tenant?: null | string
   created_at?: number
   latest_summary?: null | string
+  /** Current native handoff/failure, absent on older backends. Never historical. */
+  current_attention?: null | {
+    kind: 'awaiting-answer' | 'awaiting-test' | 'run-failed'
+    run_id: number
+    summary?: null | string
+  }
   comment_count?: number
   link_counts?: { parents: number; children: number }
   /** N-of-M child completion, or null when the task has no children. */

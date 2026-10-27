@@ -205,7 +205,49 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
-def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
+def _current_attention(task, events, runs) -> dict | None:
+    """Project the current native handoff/failure; never infer it from prose.
+
+    Inputs are already ordered by id by the diagnostic bulk read. Event ids,
+    not wall-clock timestamps, distinguish reopen/review in the same second.
+    """
+    if task["status"] in {"running", "done", "archived"} or task["claim_lock"] or not runs:
+        return None
+    run = runs[-1]
+    if run["ended_at"] is None or task["current_run_id"] is not None:
+        return None
+    kind = None
+    event = None
+    if task["status"] == "review" and run["outcome"] == "review_requested":
+        event = next((e for e in reversed(events) if e["kind"] == "review_requested"), None)
+        try:
+            metadata = json.loads(run["metadata"] or "null")
+        except (TypeError, ValueError):
+            return None
+        reason = metadata.get("wait_reason") if isinstance(metadata, dict) else None
+        if isinstance(reason, str) and reason in {"awaiting-answer", "awaiting-test"}:
+            kind = reason
+    elif run["outcome"] in {"crashed", "timed_out", "spawn_failed", "gave_up"}:
+        kind = "run-failed"
+        event = next((e for e in reversed(events) if e["run_id"] == run["id"]
+                      and e["kind"] in {"crashed", "timed_out", "spawn_failed", "protocol_violation", "gave_up"}), None)
+    if not kind or event is None or event["run_id"] != run["id"]:
+        return None
+    # Harmless comments, assignment and priority edits do not answer a question.
+    # Explicit lifecycle changes do, even when old metadata stays in history.
+    resets = {"claimed", "spawned", "worker_registered", "reclaimed", "reconciled", "review_reopened",
+              "changes_requested", "review_requested", "completed", "blocked", "unblocked", "specified",
+              "promoted", "promoted_manual", "archived", "scheduled", "status", "descendant_invalidated"}
+    if any(e["id"] > event["id"] and e["kind"] in resets for e in events):
+        return None
+    summary = (run["error"] or run["summary"]) if kind == "run-failed" else run["summary"]
+    return {"kind": kind, "run_id": run["id"], "summary": summary or None}
+
+
+def _compute_task_diagnostics(
+    conn: sqlite3.Connection, task_ids: Optional[list[str]] = None,
+    *, attention: dict[str, dict] | None = None,
+) -> dict[str, list[dict]]:
     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
     queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
     from hermes_cli.config import load_config
@@ -234,6 +276,10 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     out: dict[str, list[dict]] = {}
     for r in rows:
         tid = r["id"]
+        if attention is not None:
+            current = _current_attention(r, events_by_task[tid], runs_by_task[tid])
+            if current:
+                attention[tid] = current
         diags = kd.compute_task_diagnostics(
             r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid))
         if diags:
@@ -312,7 +358,8 @@ def get_board(
             p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
             p["total"] += 1
             p["done"] += row["cstatus"] == "done"
-        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+        attention: dict[str, dict] = {}
+        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None, attention=attention)
         latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
@@ -331,6 +378,9 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
+            if t.id in attention:
+                current = attention[t.id]
+                d["current_attention"] = dict(current, summary=(current["summary"] or "")[:_CARD_SUMMARY_PREVIEW_CHARS] or None)
             columns[t.status if t.status in columns else "todo"].append(d)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
@@ -395,7 +445,10 @@ def get_task(
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
-        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
+        attention: dict[str, dict] = {}
+        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id], attention=attention).get(task_id) or [])
+        if task_id in attention:
+            task_d["current_attention"] = attention[task_id]
         return {
             "task": task_d,
             "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
