@@ -101,6 +101,7 @@ import {
   PriorityGlyph,
   RunClock,
   shortId,
+  TaskAttention,
   useDefaultAssignee,
   useKanban,
   useOrchestration
@@ -307,6 +308,7 @@ function Card({
           <span className="line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground">
             {task.title || task.id}
           </span>
+          <TaskAttention task={task} />
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
