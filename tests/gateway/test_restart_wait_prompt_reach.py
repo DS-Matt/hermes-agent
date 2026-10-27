@@ -244,10 +244,10 @@ def test_update_drain_hint_names_the_draining_profile(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("opened_in_wait", [False, True])
-async def test_restart_wait_cuts_sockets_opened_before_it(tmp_path, monkeypatch, opened_in_wait):
-    """Only a socket admitted INTO the restart wait outlives it. One opened while the owner was ready
-    (a kanban worker polling its card's receipt) is cut when the wait opens, as before #139041, so its
-    client reconnects to the next owner instead of pinning the drain to its cap."""
+@pytest.mark.parametrize("stopping", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+async def test_restart_wait_preserves_existing_native_receipt_sockets(tmp_path, monkeypatch, opened_in_wait, stopping, native):
+    """Existing receipt observers must stay alive until the owner's active work has finished."""
     import json
 
     from gateway.run_api import GatewayRuntimeAPI
@@ -278,29 +278,45 @@ async def test_restart_wait_cuts_sockets_opened_before_it(tmp_path, monkeypatch,
                 received.append(("disconnect", message.get("code")))
                 return
             received.append(("text", message.get("text")))
+            if stopping:
+                runner._running = False
+                runner.session_runtime_descriptor.pop("drain_reason", None)
 
-    async def fallback(*args):
-        pytest.fail("a ticketed native socket must not enter the legacy fallback")
+    async def fallback(scope, receive, send):
+        from starlette.websockets import WebSocket
+        assert not native, "a ticketed native socket must not enter the legacy fallback"
+        await handle(WebSocket(scope, receive, send))
 
     monkeypatch.setattr("tui_gateway.ws.handle_ws", handle)
     monkeypatch.setattr(web, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
     monkeypatch.setattr(web_server_chat, "_ws_request_is_allowed", lambda ws: True)
     frame = json.dumps({"method": "prompt.receipt"})
     incoming = iter([{"type": "websocket.connect"}, {"type": "websocket.receive", "text": frame},
+                     {"type": "websocket.receive", "text": frame},
                      {"type": "websocket.disconnect", "code": 1000}])
 
     async def receive():
         return next(incoming)
 
+    sent = []
+
     async def send(value):
-        pass
+        sent.append(value)
 
     scope = {"type": "websocket", "path": "/api/ws", "scheme": "ws", "query_string": b"",
              "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 9999),
              "headers": [(b"sec-websocket-protocol", ("hermes-gateway-v1, hermes-gateway-ticket." + ticket).encode())],
              "subprotocols": ["hermes-gateway-v1", "hermes-gateway-ticket." + ticket]}
+    if not native:
+        scope.update(headers=[], subprotocols=[])
     await GatewayRuntimeAPI(fallback, runner, web.app)(scope, receive, send)
-    if opened_in_wait:
-        assert received == [("text", frame), ("disconnect", 1000)], received
-    else:
-        assert received == [("disconnect", 1013)], received
+    if not native:
+        if opened_in_wait:
+            assert sent[-1] == {"type": "websocket.close", "code": 1013, "reason": ""}
+            assert not received
+        else:
+            assert received == [("disconnect", 1013)]
+        return
+    expected = [("text", frame), ("disconnect", 1013)] if stopping else [
+        ("text", frame), ("text", frame), ("disconnect", 1000)]
+    assert received == expected, received
