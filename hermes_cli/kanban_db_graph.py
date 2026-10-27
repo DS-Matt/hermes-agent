@@ -1,9 +1,28 @@
-"""Task graph initialization and atomic decomposition persistence."""
+"""Task graph initialization, dependency handoffs and atomic decomposition persistence."""
 from __future__ import annotations
 
 import sqlite3
 import time
 from typing import Any, Optional
+
+
+def parent_completed_during_claim(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Prove new dependency context arrived during the current live attempt.
+
+    Called inside block_task's write transaction after all parents are terminal.
+    Event IDs preserve ordering even when claim and completion share a timestamp;
+    a later claim cannot reuse this receipt to bypass the sticky-block breaker.
+    """
+    return conn.execute(
+        "SELECT 1 FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+        "JOIN task_events c ON c.task_id = t.id AND c.run_id = r.id AND c.kind = 'claimed' "
+        "JOIN task_links l ON l.child_id = t.id "
+        "JOIN task_events e ON e.task_id = l.parent_id AND e.kind = 'completed' "
+        "WHERE t.id = ? AND t.status = 'running' AND r.status = 'running' "
+        "AND r.ended_at IS NULL AND e.id > c.id LIMIT 1", (task_id,),
+    ).fetchone() is not None
+
 
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
