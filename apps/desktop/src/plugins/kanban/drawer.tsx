@@ -82,6 +82,7 @@ import {
   Section,
   shortId,
   StatusMenu,
+  TaskAttention,
   useDefaultAssignee,
   useKanban
 } from './ui'
@@ -1048,6 +1049,7 @@ export function TaskDrawer({
             <div className="flex min-h-0 flex-1">
               <div className="min-w-0 flex-1 overflow-y-auto px-5 pb-5">
                 <div className="flex flex-col gap-5">
+                  <TaskAttention detail task={task} />
                   {task.status === 'ready' && !task.assignee && !defaultAssignee && (
                     <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
                       <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-secondary)">

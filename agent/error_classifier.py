@@ -870,6 +870,15 @@ def _nous_welcome_tier(c: _Ctx) -> Optional[Verdict]:
 def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     """Highest-priority provider-specific shapes that a status code would misroute."""
     msg, status = c.msg, c.status_code
+    # DirectSDK loses the relay's DNS exception when it wraps an incomplete
+    # capture. Recognize only its typed provider envelope, not application
+    # output mentioning a socket error. DNS is transport, never quota/overflow.
+    if (c.provider_slug == "claude-subscription-directsdk-experimental"
+            and type(c.error).__name__ == "ClaudeAPIError" and status is None
+            and re.match(r"^incomplete upstream response \(first upstream attempt: "
+                         r"status none, capture incomplete, relay failure gaierror, "
+                         r"native retries denied: \d+\)(?::|$)", msg)):
+        return _v(_R.timeout, error_context={"provider_transport": "dns"})
     # Deterministic for this context: another provider would receive the same connector result.
     if c.code == "data_policy_denied":
         return _v(_R.data_policy_denied, retryable=False, should_fallback=False)

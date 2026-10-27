@@ -300,3 +300,29 @@ export function ScrollFade({ children, deps, max = '9rem' }: { children: ReactNo
     </FadeScroll>
   )
 }
+
+/** Current action/failure supplied by the backend, never guessed from history. */
+export function TaskAttention({ task, detail = false }: { task: KanbanTask; detail?: boolean }) {
+  const k = useKanban()
+  const attention = task.current_attention
+  const label = attention && k.attention[attention.kind]
+
+  // Clear an optimistic move immediately, before the next authoritative fetch.
+  const visible =
+    attention?.kind === 'run-failed' ? !['running', 'done', 'archived'].includes(task.status) : task.status === 'review'
+
+  if (!attention || !label || !visible) {
+    return null
+  }
+
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <span
+        className={`rounded border border-current px-1.5 py-0.5 text-[0.6875rem] font-medium ${attention.kind === 'run-failed' ? 'text-destructive' : 'text-(--ui-text-primary)'}`}
+      >
+        {label}
+      </span>
+      {detail && attention.summary && <p className="whitespace-pre-wrap break-words text-sm">{attention.summary}</p>}
+    </div>
+  )
+}
