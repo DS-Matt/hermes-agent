@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import { exposePluginSDK, getPluginComponent } from "./registry";
 
@@ -37,25 +38,35 @@ beforeAll(async () => {
   await import("../../../plugins/kanban/dashboard/dist/index.js");
 });
 
-afterEach(cleanup);
+let root: Root | undefined;
+let container: HTMLDivElement;
+afterEach(async () => {
+  await act(async () => root?.unmount());
+  container?.remove();
+});
 
 it("renders the served plugin's colored card badges and the same single badge in detail", async () => {
   const Page = getPluginComponent("kanban")!;
-  const { container } = render(<Page />);
-  await screen.findByText("Release review");
-  const card = screen.getByText("Release review").closest(".hermes-kanban-card") as HTMLElement;
-  expect(within(card).getAllByText("Final PR")).toHaveLength(1);
-  expect(within(card).queryByText("Awaiting your testing")).toBeNull();
-  expect(screen.getByText("Final PR").className).toContain("attention--success");
-  expect(screen.getByText("Awaiting your testing").className).toContain("attention--info");
-  expect(screen.getByText("Needs your answer").className).toContain("attention--warning");
-  expect(screen.getByText("Run failed").className).toContain("attention--danger");
-  expect(screen.queryByText("Old approval")).toBeNull();
-  expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeTruthy();
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  await act(async () => root!.render(<Page />));
+  const card = container.querySelector('[data-task-id="final"]')!;
+  const badge = card.querySelector(".hermes-kanban-task-attention--success")!;
+  expect(badge.textContent).toBe("Final PR");
+  expect(card.querySelectorAll(".hermes-kanban-task-attention span")).toHaveLength(1);
+  expect(card.textContent).not.toContain("Awaiting your testing");
+  for (const [id, tone, label] of [
+    ["test", "info", "Awaiting your testing"], ["answer", "warning", "Needs your answer"],
+    ["failure", "danger", "Run failed"], ["escaped", "info", "<img src=x onerror=alert(1)>"],
+  ]) {
+    expect(container.querySelector(`[data-task-id="${id}"] .hermes-kanban-task-attention--${tone}`)?.textContent).toBe(label);
+  }
+  expect(container.textContent).not.toContain("Old approval");
   expect(container.querySelector("img")).toBeNull();
-  fireEvent.click(screen.getByText("Release review"));
-  const detail = await screen.findByText("Status");
-  const drawer = detail.closest(".hermes-kanban-drawer-body") as HTMLElement;
-  expect(within(drawer).getAllByText("Final PR")).toHaveLength(1);
-  expect(within(drawer).queryByText("Awaiting your testing")).toBeNull();
+  await act(async () => card.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  const drawer = container.querySelector(".hermes-kanban-drawer-body")!;
+  expect(drawer.querySelectorAll(".hermes-kanban-task-attention span")).toHaveLength(1);
+  expect(drawer.querySelector(".hermes-kanban-task-attention--success")?.textContent).toBe("Final PR");
+  expect(drawer.textContent).not.toContain("Awaiting your testing");
 });
