@@ -1292,10 +1292,6 @@ def max_retries_exhausted_result(
     if _keep_partial:
         result["final_response"] = _final_response
         result["partial"] = True
-    # Carry only the proved transport category, never arbitrary provider context
-    # or error prose, to native Kanban's existing cooldown receipt.
-    if classified.reason == FailoverReason.timeout and (classified.error_context or {}).get("provider_transport") == "dns":
-        result["failure_transport"] = "dns"
     _stamp_limit_reset(result, agent, api_error, classified)
     if _free_tier_kind:
         _stamp_free_tier(result, _free_tier_kind, (

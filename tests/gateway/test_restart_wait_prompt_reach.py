@@ -246,8 +246,8 @@ def test_update_drain_hint_names_the_draining_profile(tmp_path, monkeypatch):
 @pytest.mark.parametrize("opened_in_wait", [False, True])
 @pytest.mark.parametrize("stopping", [False, True])
 @pytest.mark.parametrize("native", [False, True])
-async def test_restart_wait_preserves_existing_native_receipt_sockets(tmp_path, monkeypatch, opened_in_wait, stopping, native):
-    """Existing receipt observers must stay alive until the owner's active work has finished."""
+async def test_restart_wait_cuts_sockets_opened_before_it(tmp_path, monkeypatch, opened_in_wait, stopping, native):
+    """Only sockets admitted during restart wait may answer parked prompts until stop begins."""
     import json
 
     from gateway.run_api import GatewayRuntimeAPI
@@ -316,6 +316,9 @@ async def test_restart_wait_preserves_existing_native_receipt_sockets(tmp_path, 
             assert not received
         else:
             assert received == [("disconnect", 1013)]
+        return
+    if not opened_in_wait:
+        assert received == [("disconnect", 1013)]
         return
     expected = [("text", frame), ("disconnect", 1013)] if stopping else [
         ("text", frame), ("text", frame), ("disconnect", 1000)]

@@ -878,7 +878,7 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
             and re.match(r"^incomplete upstream response \(first upstream attempt: "
                          r"status none, capture incomplete, relay failure gaierror, "
                          r"native retries denied: \d+\)(?::|$)", msg)):
-        return _v(_R.timeout, error_context={"provider_transport": "dns"})
+        return _V_TIMEOUT
     # Deterministic for this context: another provider would receive the same connector result.
     if c.code == "data_policy_denied":
         return _v(_R.data_policy_denied, retryable=False, should_fallback=False)

@@ -64,7 +64,6 @@ def build_kanban_policy(connection, params, config):
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
     context['db'] = str(path)
-    context['transport_scope'] = kb._profile_transport_scope(task.assignee, task.model_override, task.provider_override)
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
     return replace(policy, source='kanban', platform='cli', toolsets=tuple(sorted(set(policy.toolsets) | {'kanban'})),
@@ -276,19 +275,17 @@ def _run_worker_turns(agent, frame, history):
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    code, last_output, transport_scope = 1, '', None
+    code, last_output = 1, ''
     try:
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
-        if isinstance(result, dict) and result.get('failure_transport') == 'dns' and result.get('failure_reason') == 'timeout':
-            transport_scope = context.get('transport_scope')
         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
         raise
     finally:
-        _record_worker_result(context, code, last_output, transport_scope=transport_scope)
+        _record_worker_result(context, code, last_output)
 
 
 def record_start_failure(frame, exc):
@@ -301,7 +298,7 @@ def record_start_failure(frame, exc):
     _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
 
 
-def _record_worker_result(context, code, last_output, *, transport_scope=None):
+def _record_worker_result(context, code, last_output):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -310,11 +307,9 @@ def _record_worker_result(context, code, last_output, *, transport_scope=None):
         if _bound_worker_matches(conn, context):
             # Closing a run clears its claim/PID and replaces metadata; keep the
             # result in the immutable attempt event stream instead.
-            payload = {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                       'last_output': last_output}
-            if code == kb.KANBAN_RATE_LIMIT_EXIT_CODE and transport_scope:
-                payload['dns_transport_scope'] = transport_scope
-            kb._append_event(conn, context['task_id'], 'worker_result', payload, run_id=context['run_id'])
+            kb._append_event(conn, context['task_id'], 'worker_result',
+                {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                 'last_output': last_output}, run_id=context['run_id'])
 
 
 def _bound_worker_matches(conn, context):

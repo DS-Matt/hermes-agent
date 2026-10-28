@@ -1560,8 +1560,6 @@ def check_respawn_guard(
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready/review row before any claim attempt. Priority order:
-    ``"profile_transport_cooldown"`` (proved DNS failure on the same unchanged
-    profile/config and overrides; protects fresh cards without cooling other profiles),
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
@@ -1578,7 +1576,7 @@ def check_respawn_guard(
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error, assignee, model_override, provider_override FROM tasks WHERE id = ?",
+        "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1592,20 +1590,6 @@ def check_respawn_guard(
     #    condition is not the card's, so it retries forever, spaced, and never
     #    reaches the breaker.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
-    # A proved DNS outage belongs to the unchanged profile route, not the next
-    # fresh card. Reuse the native cooldown and immutable worker receipt. Generic
-    # timeouts/quota and legacy receipts retain their existing per-card policy.
-    if rl_cooldown > 0 and row["assignee"]:
-        scope = _kb._profile_transport_scope(row["assignee"], row["model_override"], row["provider_override"])
-        if scope:
-            failures = conn.execute(
-                "SELECT e.payload FROM task_events e JOIN task_runs r ON r.id=e.run_id AND r.task_id=e.task_id "
-                "WHERE r.profile=? AND r.outcome='rate_limited' AND r.ended_at>? "
-                "AND e.kind='worker_result' ORDER BY e.id DESC",
-                (row["assignee"], now - rl_cooldown),
-            )
-            if any(_kb._json_dict(event["payload"]).get("dns_transport_scope") == scope for event in failures):
-                return "profile_transport_cooldown"
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
