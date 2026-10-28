@@ -30,7 +30,7 @@ vi.mock('./api', async importOriginal => ({
             id: 'final',
             title: 'Selected final',
             status: 'review',
-            current_attention: { kind: 'awaiting-test', run_id: 2, final_pr: true }
+            current_attention: { kind: 'awaiting-test', run_id: 2, badge: { label: 'Final PR', tone: 'success' } }
           }
         ]
       }
@@ -49,7 +49,7 @@ afterEach(() => {
   disposeLocales()
 })
 
-it('highlights only the selected final card without changing order or count', async () => {
+it('shows the producer badge without changing card order or count', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   const { container } = render(
@@ -63,9 +63,7 @@ it('highlights only the selected final card without changing order or count', as
   expect(cards).toHaveLength(2)
   expect(cards[0].textContent).toContain('Approved Draft')
   expect(cards[1].textContent).toContain('Selected final')
-  expect(cards[0].classList.contains('border-primary/40')).toBe(false)
-  expect(cards[1].classList.contains('border-primary/40')).toBe(true)
-  expect(screen.getAllByText(en.attention['awaiting-test'])).toHaveLength(2)
-  expect(screen.getAllByText(en.finalPr)).toHaveLength(1)
+  expect(screen.getAllByText(en.attention['awaiting-test'])).toHaveLength(1)
+  expect(screen.getAllByText('Final PR')).toHaveLength(1)
   client.clear()
 })

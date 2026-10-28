@@ -1379,15 +1379,15 @@ def test_current_attention_unblock_clears_failure_without_erasing_run_history(cl
     assert "current_attention" not in _attention_task(client, tid)
 
 
-def test_final_pr_marker_reaches_board_and_drawer_without_lifecycle_change(client):
+def test_review_badge_reaches_board_and_drawer_without_lifecycle_change(client):
     from hermes_cli.kanban_db_attention import set_review_attention
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title='Selected PR', assignee='forge')
         assert kb.request_review(conn, tid, metadata={'wait_reason': 'awaiting-test'})
     current = _attention_task(client, tid)['current_attention']
     with kbc.connect() as conn:
-        assert set_review_attention(conn, tid, expected_handoff_event_id=current['handoff_event_id'], final_pr=True)
+        assert set_review_attention(conn, tid, expected_handoff_event_id=current['handoff_event_id'], badge={"label": "Acceptance ready", "tone": "success"})
     for task in (_attention_task(client, tid), client.get(f'/api/plugins/kanban/tasks/{tid}').json()['task']):
         assert task['status'] == 'review'
         assert task['current_attention']['kind'] == 'awaiting-test'
-        assert task['current_attention']['final_pr'] is True
+        assert task['current_attention']['badge'] == {'label': 'Acceptance ready', 'tone': 'success'}

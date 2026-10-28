@@ -121,19 +121,22 @@ A worker that is blocked on `t_parent` and creates a support card for the missin
 
 They also coexist inside one run. A kanban task executes in an isolated managed worker under the profile's gateway, and its `delegate_task` children are reserved by that gateway under the worker's execution: each child gets its own session (listed as a subagent of the card's session), counts against `delegation.max_concurrent_children` and `delegation.max_spawn_depth`, returns its result inside the card's turn, and ends with the worker. If the gateway goes down mid-child, the child is retired, never resumed. Work that must outlive the gateway, or needs its own reviewer, still belongs in child cards (`kanban_create` with `parents`).
 
-A review card's **Final PR** badge is a producer-supplied display assertion alongside
-**Awaiting your testing**. It distinguishes a selected final pull request from a Draft;
-it does not assert that CI passed or that the PR is safe to merge, change board order,
-or reserve a worker slot. Older producers/backends simply omit it.
+Current handoffs display one attention badge in Desktop and the web board: blue for
+awaiting testing, amber for an answer, and red for a failed run. A producer may supply
+a short plain-text badge and semantic tone for the current testing handoff. It replaces
+the default testing label without changing the underlying wait state, order or worker slots.
 
 Native integrations can call
-`hermes_cli.kanban_db_attention.set_review_attention(conn, task_id, expected_handoff_event_id=..., final_pr=True)`
-(or `False` to clear). The expected event ID is exposed as `current_attention.handoff_event_id`.
+`hermes_cli.kanban_db_attention.set_review_attention(conn, task_id, expected_handoff_event_id=..., badge={"label": "Ready for acceptance", "tone": "success"})`
+(or `badge=None` to clear). Labels must be nonempty and at most 80 characters;
+tones are `success`, `info`, `warning` or `danger`. The expected event ID is exposed
+as `current_attention.handoff_event_id` and in native `kanban show --json` events.
 The setter accepts only the current unclaimed, ended `awaiting-test` review handoff,
 returns `False` for stale/ineligible handoffs and `True` for valid writes or identical no-ops.
 It appends a run-bound `review_attention` event without rewriting approval metadata.
-A new claim, handoff or lifecycle transition invalidates the old assertion automatically.
-Selection policy belongs to the integration; Core does not query a forge or impose a PR cap.
+A new claim, handoff or lifecycle transition invalidates the annotation automatically.
+Selection policy and custom wording belong to the producer. Older backends without a
+badge retain the ordinary attention label; older clients ignore the optional badge.
 
 ## Core concepts
 

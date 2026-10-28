@@ -34,7 +34,6 @@ type KanbanMessages = {
   moveTo: (label: string) => string
   delete: string
   reviewChecking: string
-  finalPr: string
   attention: Record<'awaiting-answer' | 'awaiting-test' | 'run-failed', string>
   attachedTip: (name: string) => string
   orchestratorTip: (name: string) => string
@@ -261,7 +260,6 @@ export const en: KanbanMessages = {
   moveTo: label => `Move to ${label}`,
   delete: 'Delete',
   reviewChecking: 'A review agent is checking the completed work.',
-  finalPr: 'Final PR',
   attention: {
     'awaiting-answer': 'Needs your answer',
     'awaiting-test': 'Awaiting your testing',
@@ -495,7 +493,6 @@ const ja: KanbanMessages = {
   moveTo: label => `${label} へ移動`,
   delete: '削除',
   reviewChecking: 'レビューエージェントが完了した作業を確認中です。',
-  finalPr: '最終 PR',
   attention: { 'awaiting-answer': '回答が必要です', 'awaiting-test': 'テスト待ち', 'run-failed': '実行に失敗しました' },
   attachedTip: name => `${name} が担当 — ディスパッチャが次のティック（≤1分）で引き渡します。`,
   orchestratorTip: name => `${name}（オーケストレーター）が次のティックでこれを取得し、仕様を書きます。`,
@@ -724,7 +721,6 @@ const zh: KanbanMessages = {
   moveTo: label => `移动到 ${label}`,
   delete: '删除',
   reviewChecking: '审查代理正在检查已完成的工作。',
-  finalPr: '最终 PR',
   attention: { 'awaiting-answer': '需要您的答复', 'awaiting-test': '等待您测试', 'run-failed': '运行失败' },
   attachedTip: name => `${name} 已接手 — 调度器将在下一个周期（≤1 分钟）移交。`,
   orchestratorTip: name => `${name}（编排者）将在下一个周期领取并撰写规格。`,
@@ -950,7 +946,6 @@ const zhHant: KanbanMessages = {
   moveTo: label => `移至 ${label}`,
   delete: '刪除',
   reviewChecking: '審查代理正在檢查已完成的工作。',
-  finalPr: '最終 PR',
   attention: { 'awaiting-answer': '需要您的答覆', 'awaiting-test': '等待您測試', 'run-failed': '執行失敗' },
   attachedTip: name => `${name} 已接手 — 排程器將在下一個週期（≤1 分鐘）移交。`,
   orchestratorTip: name => `${name}（編排者）將在下一個週期領取並撰寫規格。`,
