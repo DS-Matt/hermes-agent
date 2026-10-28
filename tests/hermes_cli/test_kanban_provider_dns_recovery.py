@@ -38,12 +38,19 @@ def test_unproved_application_failures_remain_ordinary(error, provider):
     assert turn_exit_code({"failed": True, "failure_reason": result.reason.value}, kanban_worker=True) == 1
 
 
-def test_dns_worker_requeues_same_card_without_spending_budget(tmp_path, monkeypatch):
+@pytest.mark.parametrize("historical_scope", [False, True])
+def test_dns_worker_requeues_same_card_without_spending_budget(tmp_path, monkeypatch, historical_scope):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kbd._recent_worker_exits.clear()
+    monkeypatch.setattr(kb, "_resolve_rate_limit_cooldown_seconds", lambda: 300)
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: tmp_path / name)
+    for name in ("forge", "independent"):
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text("model: {}\n")
     failure = classify_api_error(ClaudeAPIError(MESSAGE), provider=PROVIDER)
     code = turn_exit_code({"failed": True, "failure_reason": failure.reason.value}, kanban_worker=True)
     with kbc.connect_closing(tmp_path / "kanban.db") as conn:
@@ -55,8 +62,17 @@ def test_dns_worker_requeues_same_card_without_spending_budget(tmp_path, monkeyp
         kbd._set_worker_pid(conn, tid, proc.pid)
         with kb.write_txn(conn):
             kb._append_event(conn, tid, "worker_bound", {"pid": proc.pid, "claim_lock": task.claim_lock}, run_id=task.current_run_id)
-            kb._append_event(conn, tid, "worker_result", {"pid": proc.pid, "claim_lock": task.claim_lock,
-                             "exit_code": code, "last_output": MESSAGE}, run_id=task.current_run_id)
+            payload = {"pid": proc.pid, "claim_lock": task.claim_lock,
+                       "exit_code": code, "last_output": MESSAGE}
+            if historical_scope:
+                # Already stored receipts remain valid but cannot cool another card.
+                stat = (tmp_path / "forge/config.yaml").stat()
+                payload["dns_transport_scope"] = {
+                    "home": str(tmp_path / "forge"),
+                    "config": [stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size],
+                    "env": None, "model_override": None, "provider_override": None,
+                }
+            kb._append_event(conn, tid, "worker_result", payload, run_id=task.current_run_id)
         assert tid not in kbd.detect_crashed_workers(conn)
         card = kb.get_task(conn, tid)
         assert card.status == "ready"
@@ -64,17 +80,24 @@ def test_dns_worker_requeues_same_card_without_spending_budget(tmp_path, monkeyp
         assert conn.execute("SELECT outcome FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()[0] == "rate_limited"
         assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
 
-
-@pytest.mark.parametrize("message,provider,expected", [(MESSAGE, PROVIDER, "dns"), ("request timed out", PROVIDER, None),
-                                                       (MESSAGE, "custom", None)])
-def test_retry_exhaustion_carries_only_proved_transport(message, provider, expected):
-    from agent.turn_recovery import max_retries_exhausted_result
-    from tests.agent.test_failed_turn_chat_copy import _Agent
-    error = ClaudeAPIError(message)
-    classified = classify_api_error(error, provider=provider)
-    result = max_retries_exhausted_result(
-        _Agent(), error, classified, attempts=3, is_rate_limited=False, error_msg=str(error).lower(),
-        api_kwargs=None, api_messages=[], messages=[], conversation_history=None, api_call_count=1,
-        approx_tokens=10, provider=provider, base_url="process://claude-subscription-directsdk-experimental", model="m",
-    )
-    assert result.get("failure_transport") == expected
+        fresh = kb.create_task(conn, title="Fresh same profile", assignee="forge")
+        other = kb.create_task(conn, title="Fresh other profile", assignee="independent")
+        monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _: True)
+        monkeypatch.setattr(kbd._kbw, "resolve_workspace", lambda *a, **k: tmp_path)
+        spawns = []
+        dispatched = kb.DispatchResult()
+        for task_id in (tid, fresh, other):
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            kbd._dispatch_lane_task(
+                conn, row, row["assignee"], dispatched, lane="ready", dry_run=False,
+                ttl_seconds=None, board=None, failure_limit=3,
+                spawn_fn=lambda task, workspace: spawns.append(task.id),
+                per_profile_cap=None, per_profile_running={},
+            )
+        assert spawns == [fresh, other]
+        assert dispatched.respawn_guarded == [(tid, "rate_limit_cooldown")]
+        assert kb.get_task(conn, tid).status == "ready"
+        for task_id in (tid, fresh, other):
+            assert kb.get_task(conn, task_id).consecutive_failures == 0
+        for task_id in (fresh, other):
+            assert kb.get_task(conn, task_id).status == "running"

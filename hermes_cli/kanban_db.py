@@ -3179,13 +3179,9 @@ def block_task(
                 and not parent_completed_during_claim(conn, task_id)):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
-        prev_recurrences = int(_row_get(cur_row, "block_recurrences") or 0)
-        if (kind == "transient" and _row_get(cur_row, "block_kind") == "transient"
-                and _transient_block_changed_phase(conn, task_id)):
-            prev_recurrences = 0
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
-            prev_recurrences=prev_recurrences,
+            prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3217,73 +3213,6 @@ def block_task(
             return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
-
-
-def _profile_transport_scope(profile: str, model_override=None, provider_override=None) -> Optional[dict]:
-    """A conservative profile/config revision for sharing a DNS cooldown.
-
-    No endpoint equality across profiles is assumed. Missing/unreadable config
-    has no scope; replacement or edits to config/.env invalidate old receipts.
-    Only file identity is recorded, never config values or credentials.
-    """
-    from hermes_cli.profiles import get_profile_dir
-    try:
-        home = get_profile_dir(profile).resolve()
-        def revision(name):
-            try:
-                st = (home / name).stat()
-                return [st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size]
-            except FileNotFoundError:
-                return None
-        config = revision("config.yaml")
-        if config is None:
-            return None
-        return {"home": str(home), "config": config, "env": revision(".env"),
-                "model_override": model_override, "provider_override": provider_override}
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def _transient_block_changed_phase(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Separate transient episodes only after a proven cross-profile review handoff.
-
-    A reviewer's unavailable peer and an implementer's later test-host failure
-    are not an unblock loop. Use actual run profiles and native handoff events,
-    never the mutable assignee or the worker's prose. Legacy/missing provenance,
-    manual reassignment and repeated blocks within one profile keep the breaker.
-    """
-    current = conn.execute(
-        "SELECT r.profile, r.id AS run_id FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.id = ? AND r.task_id = t.id AND r.ended_at IS NULL", (task_id,),
-    ).fetchone()
-    previous = conn.execute(
-        "SELECT e.id, e.payload, r.profile, r.id AS run_id FROM task_events e "
-        "LEFT JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
-        "WHERE e.task_id = ? AND e.kind IN ('blocked', 'block_loop_detected') "
-        "ORDER BY e.id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if current is None or previous is None:
-        return False
-    old_profile, new_profile = previous["profile"], current["profile"]
-    if (not old_profile or not new_profile or old_profile == new_profile
-            or _json_dict(previous["payload"]).get("kind") != "transient"):
-        return False
-    handoff = conn.execute(
-        "SELECT e.kind, e.payload, r.profile, r.outcome, r.id AS run_id FROM task_events e "
-        "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
-        "WHERE e.task_id = ? AND e.id > ? "
-        "AND e.kind IN ('review_requested', 'changes_requested') "
-        "ORDER BY e.id DESC LIMIT 1", (task_id, previous["id"]),
-    ).fetchone()
-    if handoff is None or handoff["profile"] != old_profile or handoff["outcome"] != handoff["kind"]:
-        return False
-    # Ready-state transitions synthesize runs from the mutable assignee; only
-    # claimed executions prove that the sender and recipient actually ran.
-    if any(not _latest_event(conn, task_id, "claimed", row["run_id"]) for row in (previous, handoff, current)):
-        return False
-    payload = _json_dict(handoff["payload"])
-    sender, recipient = ("implementer", "reviewer") if handoff["kind"] == "review_requested" else ("reviewer", "implementer")
-    return payload.get(sender) == old_profile and payload.get(recipient) == new_profile
 
 
 def _route_block(
