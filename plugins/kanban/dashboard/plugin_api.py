@@ -28,6 +28,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from hermes_cli.kanban_db_attention import current_attention
 from hermes_cli import kanban_db
 from hermes_cli import kanban_workflow
 from hermes_cli.web_read_coalescing import coalesced_read
@@ -205,45 +206,6 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
-def _current_attention(task, events, runs) -> dict | None:
-    """Project the current native handoff/failure; never infer it from prose.
-
-    Inputs are already ordered by id by the diagnostic bulk read. Event ids,
-    not wall-clock timestamps, distinguish reopen/review in the same second.
-    """
-    if task["status"] in {"running", "done", "archived"} or task["claim_lock"] or not runs:
-        return None
-    run = runs[-1]
-    if run["ended_at"] is None or task["current_run_id"] is not None:
-        return None
-    kind = None
-    event = None
-    if task["status"] == "review" and run["outcome"] == "review_requested":
-        event = next((e for e in reversed(events) if e["kind"] == "review_requested"), None)
-        try:
-            metadata = json.loads(run["metadata"] or "null")
-        except (TypeError, ValueError):
-            return None
-        reason = metadata.get("wait_reason") if isinstance(metadata, dict) else None
-        if isinstance(reason, str) and reason in {"awaiting-answer", "awaiting-test"}:
-            kind = reason
-    elif run["outcome"] in {"crashed", "timed_out", "spawn_failed", "gave_up"}:
-        kind = "run-failed"
-        event = next((e for e in reversed(events) if e["run_id"] == run["id"]
-                      and e["kind"] in {"crashed", "timed_out", "spawn_failed", "protocol_violation", "gave_up"}), None)
-    if not kind or event is None or event["run_id"] != run["id"]:
-        return None
-    # Harmless comments, assignment and priority edits do not answer a question.
-    # Explicit lifecycle changes do, even when old metadata stays in history.
-    resets = {"claimed", "spawned", "worker_registered", "reclaimed", "reconciled", "review_reopened",
-              "changes_requested", "review_requested", "completed", "blocked", "unblocked", "specified",
-              "promoted", "promoted_manual", "archived", "scheduled", "status", "descendant_invalidated"}
-    if any(e["id"] > event["id"] and e["kind"] in resets for e in events):
-        return None
-    summary = (run["error"] or run["summary"]) if kind == "run-failed" else run["summary"]
-    return {"kind": kind, "run_id": run["id"], "summary": summary or None}
-
-
 def _compute_task_diagnostics(
     conn: sqlite3.Connection, task_ids: Optional[list[str]] = None,
     *, attention: dict[str, dict] | None = None,
@@ -277,7 +239,7 @@ def _compute_task_diagnostics(
     for r in rows:
         tid = r["id"]
         if attention is not None:
-            current = _current_attention(r, events_by_task[tid], runs_by_task[tid])
+            current = current_attention(r, events_by_task[tid], runs_by_task[tid])
             if current:
                 attention[tid] = current
         diags = kd.compute_task_diagnostics(

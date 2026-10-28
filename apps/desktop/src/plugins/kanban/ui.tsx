@@ -307,13 +307,20 @@ interface TaskAttentionProps {
   task: KanbanTask
 }
 
+const ATTENTION_VARIANTS = {
+  success: 'success', info: 'info', warning: 'warn', danger: 'destructive'
+} as const
+
+const DEFAULT_ATTENTION_TONES = {
+  'awaiting-answer': 'warning', 'awaiting-test': 'info', 'run-failed': 'danger'
+} as const
+
 /** Current action/failure supplied by the backend, never guessed from history. */
 export function TaskAttention({ task, detail = false }: TaskAttentionProps) {
   const k = useKanban()
   const attention = task.current_attention
   const label = attention && k.attention[attention.kind]
 
-  // Clear an optimistic move immediately, before the next authoritative fetch.
   const visible =
     attention?.kind === 'run-failed' ? !['running', 'done', 'archived'].includes(task.status) : task.status === 'review'
 
@@ -321,11 +328,16 @@ export function TaskAttention({ task, detail = false }: TaskAttentionProps) {
     return null
   }
 
+  const badge = attention.kind === 'awaiting-test' ? attention.badge : undefined
+
+  const custom = badge && typeof badge.label === 'string' && badge.label.trim() &&
+    badge.label.length <= 80 && Object.hasOwn(ATTENTION_VARIANTS, badge.tone) ? badge : undefined
+
+  const tone = custom?.tone ?? DEFAULT_ATTENTION_TONES[attention.kind]
+
   return (
     <div className="flex flex-col items-start gap-1">
-      <Badge size="xs" variant={attention.kind === 'run-failed' ? 'destructive' : 'warn'}>
-        {label}
-      </Badge>
+      <Badge size="xs" variant={ATTENTION_VARIANTS[tone]}>{custom?.label ?? label}</Badge>
       {detail && attention.summary && <p className="whitespace-pre-wrap break-words text-sm">{attention.summary}</p>}
     </div>
   )

@@ -60,3 +60,46 @@ describe('current task attention', () => {
     expect(container.querySelector('img')).toBeNull()
   })
 })
+
+describe('producer review badge', () => {
+  it('replaces the testing label with one green badge in card and drawer', () => {
+    const selected = { ...task, current_attention: {
+      kind: 'awaiting-test' as const, run_id: 9, badge: { label: 'Final PR', tone: 'success' as const }
+    } }
+
+    const { rerender } = render(<TaskAttention task={selected} />)
+    expect(screen.queryByText(en.attention['awaiting-test'])).toBeNull()
+    expect(screen.getAllByText('Final PR')).toHaveLength(1)
+    expect(screen.getByText('Final PR').className).toContain('text-emerald-600')
+    rerender(<TaskAttention detail task={selected} />)
+    expect(screen.getAllByText('Final PR')).toHaveLength(1)
+    rerender(<TaskAttention task={{ ...selected, status: 'ready' }} />)
+    expect(screen.queryByText('Final PR')).toBeNull()
+  })
+
+  it.each(['awaiting-answer', 'run-failed'] as const)('does not replace %s with a stale badge', kind => {
+    render(<TaskAttention task={{ ...task, current_attention: {
+      kind, run_id: 9, badge: { label: 'Old approval', tone: 'success' }
+    } }} />)
+    expect(screen.queryByText('Old approval')).toBeNull()
+    expect(screen.getByText(en.attention[kind])).toBeTruthy()
+  })
+
+  it.each([
+    ['awaiting-test', 'text-blue-600'], ['awaiting-answer', 'text-amber-600'], ['run-failed', 'text-destructive']
+  ] as const)('uses the default color for %s', (kind, color) => {
+    render(<TaskAttention task={{ ...task, current_attention: { kind, run_id: 9 } }} />)
+    expect(screen.getByText(en.attention[kind]).className).toContain(color)
+  })
+
+  it('renders arbitrary producer wording as plain text', () => {
+    const label = '<img src=x onerror=alert(1)>'
+
+    const { container } = render(<TaskAttention task={{ ...task, current_attention: {
+      kind: 'awaiting-test', run_id: 9, badge: { label, tone: 'info' }
+    } }} />)
+
+    expect(screen.getByText(label)).toBeTruthy()
+    expect(container.querySelector('img')).toBeNull()
+  })
+})
