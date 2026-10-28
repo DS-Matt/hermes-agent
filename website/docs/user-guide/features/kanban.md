@@ -121,6 +121,20 @@ A worker that is blocked on `t_parent` and creates a support card for the missin
 
 They also coexist inside one run. A kanban task executes in an isolated managed worker under the profile's gateway, and its `delegate_task` children are reserved by that gateway under the worker's execution: each child gets its own session (listed as a subagent of the card's session), counts against `delegation.max_concurrent_children` and `delegation.max_spawn_depth`, returns its result inside the card's turn, and ends with the worker. If the gateway goes down mid-child, the child is retired, never resumed. Work that must outlive the gateway, or needs its own reviewer, still belongs in child cards (`kanban_create` with `parents`).
 
+A review card's **Final PR** badge is a producer-supplied display assertion alongside
+**Awaiting your testing**. It distinguishes a selected final pull request from a Draft;
+it does not assert that CI passed or that the PR is safe to merge, change board order,
+or reserve a worker slot. Older producers/backends simply omit it.
+
+Native integrations can call
+`hermes_cli.kanban_db_attention.set_review_attention(conn, task_id, expected_handoff_event_id=..., final_pr=True)`
+(or `False` to clear). The expected event ID is exposed as `current_attention.handoff_event_id`.
+The setter accepts only the current unclaimed, ended `awaiting-test` review handoff,
+returns `False` for stale/ineligible handoffs and `True` for valid writes or identical no-ops.
+It appends a run-bound `review_attention` event without rewriting approval metadata.
+A new claim, handoff or lifecycle transition invalidates the old assertion automatically.
+Selection policy belongs to the integration; Core does not query a forge or impose a PR cap.
+
 ## Core concepts
 
 - **Board** — a standalone queue of tasks with its own SQLite DB, workspaces
