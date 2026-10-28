@@ -10,6 +10,8 @@ org's private repos (#122689).
 """
 from __future__ import annotations
 
+from collections import Counter
+from datetime import datetime
 import json
 import re
 import subprocess
@@ -104,6 +106,80 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
         raise _GateAuthError(f"assignee profile {assignee!r} cannot be resolved") from None
 
 
+def _check_run_metadata(runs: list[dict], profile_home: str | None) -> dict:
+    """Read workflow identity for duplicate candidates, bound to their REST IDs."""
+    expected = {r["node_id"]: r["id"] for r in runs}
+    if (len(expected) != len(runs) or len(set(expected.values())) != len(runs)
+            or any(not isinstance(k, str) or not k or type(v) is not int for k, v in expected.items())):
+        raise ValueError("Invalid check-run identities")
+    found = {}
+    identities = list(expected)
+    for start in range(0, len(identities), 100):
+        batch = identities[start:start + 100]
+        query = ('{nodes(ids:' + json.dumps(batch) + '){... on CheckRun{'
+                 'id databaseId startedAt checkSuite{workflowRun{event workflow{databaseId}}}}}}')
+        nodes = _api("graphql", query=query, profile_home=profile_home)["data"]["nodes"]
+        for node in nodes:
+            key = node["id"]
+            if (key not in batch or key in found or type(node["databaseId"]) is not int
+                    or node["databaseId"] != expected[key]):
+                raise ValueError("Mismatched check-run metadata")
+            container = node
+            for field in ("checkSuite", "workflowRun", "workflow"):
+                container = container.get(field)
+                if container is None:
+                    break
+                if not isinstance(container, dict):
+                    raise ValueError("Invalid check-run workflow metadata")
+            found[key] = node
+    if found.keys() != expected.keys():
+        raise ValueError("Incomplete check-run metadata")
+    return found
+
+
+def _select_current_runs(runs: list[dict], *, profile_home: str | None) -> list[dict]:
+    """Discard only proved older reruns, retaining unknown or tied evidence.
+
+    Like gh's checks aggregation, identity includes workflow and event. App and
+    head identities remain separate too; workflow IDs avoid shared-title merges.
+    """
+    identified = [r for r in runs if isinstance(r.get("app"), dict)
+                  and type(r["app"].get("id")) is int]
+    counts = Counter((r["name"], r["app"]["id"]) for r in identified)
+    candidates = [r for r in identified if counts[(r["name"], r["app"]["id"])] > 1]
+    if not candidates:
+        return runs
+    metadata = _check_run_metadata(candidates, profile_home)
+    groups = {}
+    for run in candidates:
+        node = metadata[run["node_id"]]
+        started = node.get("startedAt")
+        timestamp = datetime.fromisoformat(started) if started is not None else None
+        if timestamp is not None and timestamp.utcoffset() is None:
+            raise ValueError("Check-run timestamp has no timezone")
+        try:
+            workflow_run = node["checkSuite"]["workflowRun"]
+            workflow = workflow_run["workflow"]["databaseId"]
+            event = workflow_run["event"]
+        except (KeyError, TypeError):
+            continue  # Third-party/no-workflow checks remain independent evidence.
+        if workflow is None or event is None or event == "":
+            continue
+        if type(workflow) is not int or not isinstance(event, str):
+            raise ValueError("Invalid check-run workflow identity")
+        if not event.strip():
+            continue
+        if timestamp is None:
+            continue  # An unstarted check must never disappear behind an older success.
+        key = (run["name"], run["app"]["id"], workflow, event, run["head_sha"])
+        groups.setdefault(key, []).append((timestamp, run["id"]))
+    superseded = set()
+    for group in groups.values():
+        newest = max(timestamp for timestamp, _ in group)
+        superseded.update(run_id for timestamp, run_id in group if timestamp < newest)
+    return [run for run in runs if run["id"] not in superseded]
+
+
 def collect_acceptance(contract: str, published_pr: str | None,
                        assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
@@ -155,6 +231,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
+            matching = _select_current_runs(matching, profile_home=profile_home)
             # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
             legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
             selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
