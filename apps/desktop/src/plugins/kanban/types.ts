@@ -17,6 +17,8 @@ export interface KanbanTask {
   current_attention?: null | {
     kind: 'awaiting-answer' | 'awaiting-test' | 'run-failed'
     run_id: number
+    handoff_event_id?: number
+    final_pr?: boolean
     summary?: null | string
   }
   comment_count?: number

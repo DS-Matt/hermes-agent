@@ -301,6 +301,15 @@ export function ScrollFade({ children, deps, max = '9rem' }: { children: ReactNo
   )
 }
 
+/** A display assertion, not a CI or merge-readiness decision. */
+export function isFinalPr(task: KanbanTask): boolean {
+  return (
+    task.status === 'review' &&
+    task.current_attention?.kind === 'awaiting-test' &&
+    task.current_attention.final_pr === true
+  )
+}
+
 /** Current action/failure supplied by the backend, never guessed from history. */
 export function TaskAttention({ task, detail = false }: { task: KanbanTask; detail?: boolean }) {
   const k = useKanban()
@@ -317,11 +326,18 @@ export function TaskAttention({ task, detail = false }: { task: KanbanTask; deta
 
   return (
     <div className="flex flex-col items-start gap-1">
-      <span
-        className={`rounded border border-current px-1.5 py-0.5 text-[0.6875rem] font-medium ${attention.kind === 'run-failed' ? 'text-destructive' : 'text-(--ui-text-primary)'}`}
-      >
-        {label}
-      </span>
+      <div className="flex flex-wrap items-center gap-1">
+        <span
+          className={`rounded border border-current px-1.5 py-0.5 text-[0.6875rem] font-medium ${attention.kind === 'run-failed' ? 'text-destructive' : 'text-(--ui-text-primary)'}`}
+        >
+          {label}
+        </span>
+        {isFinalPr(task) && (
+          <span className="rounded border border-primary/40 bg-primary/10 px-1.5 py-0.5 text-[0.6875rem] font-semibold text-primary">
+            {k.finalPr}
+          </span>
+        )}
+      </div>
       {detail && attention.summary && <p className="whitespace-pre-wrap break-words text-sm">{attention.summary}</p>}
     </div>
   )

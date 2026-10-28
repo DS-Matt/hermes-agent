@@ -96,6 +96,7 @@ import {
   columnLabel,
   errText,
   FIELD_LABEL,
+  isFinalPr,
   isLockedTarget,
   lockedReason,
   PriorityGlyph,
@@ -281,6 +282,7 @@ function Card({
             // Hover matches the provider-picker rows: a quiet primary fill;
             // selected = the theme's focus color (same as a focused input).
             'transition-colors hover:bg-primary/[0.06] active:cursor-grabbing',
+            isFinalPr(task) && !selected && 'border-primary/40',
             selected && 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]',
             dragging && 'opacity-40'
           )}

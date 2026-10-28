@@ -7,7 +7,7 @@ import { registerPluginLocales } from '@/i18n/plugin-i18n'
 
 import { en, KANBAN_LOCALES } from './i18n'
 import type { KanbanTask } from './types'
-import { TaskAttention } from './ui'
+import { isFinalPr, TaskAttention } from './ui'
 
 let disposeLocales: () => void
 beforeEach(() => {
@@ -58,5 +58,36 @@ describe('current task attention', () => {
 
     expect(screen.getByText(summary)).toBeTruthy()
     expect(container.querySelector('img')).toBeNull()
+  })
+})
+
+describe('selected final PR attention', () => {
+  it('keeps the testing label and adds Final PR in card and drawer', () => {
+    const selected = { ...task, current_attention: { kind: 'awaiting-test' as const, run_id: 9, final_pr: true } }
+    const { rerender } = render(<TaskAttention task={selected} />)
+    expect(screen.getByText(en.attention['awaiting-test'])).toBeTruthy()
+    expect(screen.getByText(en.finalPr)).toBeTruthy()
+    expect(isFinalPr(selected)).toBe(true)
+    rerender(<TaskAttention detail task={selected} />)
+    expect(screen.getByText(en.finalPr)).toBeTruthy()
+    rerender(<TaskAttention task={{ ...selected, status: 'ready' }} />)
+    expect(screen.queryByText(en.finalPr)).toBeNull()
+    expect(isFinalPr({ ...selected, status: 'ready' })).toBe(false)
+  })
+
+  it.each(['awaiting-answer', 'run-failed'] as const)('does not highlight %s even with a stale marker', kind => {
+    const stale = { ...task, current_attention: { kind, run_id: 9, final_pr: true } }
+    render(<TaskAttention task={stale} />)
+    expect(screen.queryByText(en.finalPr)).toBeNull()
+    expect(isFinalPr(stale)).toBe(false)
+  })
+
+  it('keeps approved Drafts and older backends unhighlighted', () => {
+    const draft = { ...task, current_attention: { kind: 'awaiting-test' as const, run_id: 9 } }
+    render(<TaskAttention task={draft} />)
+    expect(screen.getByText(en.attention['awaiting-test'])).toBeTruthy()
+    expect(screen.queryByText(en.finalPr)).toBeNull()
+    expect(isFinalPr(draft)).toBe(false)
+    expect(isFinalPr(task)).toBe(false)
   })
 })
