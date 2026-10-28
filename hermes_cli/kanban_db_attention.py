@@ -4,6 +4,12 @@ import sqlite3
 from typing import Optional
 
 
+def _valid_badge(badge) -> bool:
+    return (isinstance(badge, dict) and isinstance(badge.get("label"), str)
+            and 0 < len(badge["label"].strip()) <= 80
+            and badge.get("tone") in ("success", "info", "warning", "danger"))
+
+
 def current_attention(task, events, runs) -> Optional[dict]:
     """Project the current native handoff/failure; never infer it from prose.
 
@@ -51,22 +57,24 @@ def current_attention(task, events, runs) -> Optional[dict]:
             payload = None
         if (isinstance(payload, dict) and type(payload.get("handoff_event_id")) is int
                 and payload.get("handoff_event_id") == event["id"]
-                and payload.get("final_pr") is True):
-            attention["final_pr"] = True
+                and _valid_badge(payload.get("badge"))):
+            attention["badge"] = payload["badge"]
     return attention
 
 def set_review_attention(conn: sqlite3.Connection, task_id: str, *,
-                         expected_handoff_event_id: int, final_pr: bool) -> bool:
+                         expected_handoff_event_id: int, badge: Optional[dict]) -> bool:
     """Annotate only the current unclaimed testing handoff, without changing its lifecycle.
 
     The producer owns selection policy. Event/run identity makes stale updates harmless;
-    explicit false markers clear earlier assertions without rewriting review provenance.
+    explicit null badges clear earlier assertions without rewriting review provenance.
     True includes an identical no-op; False means the handoff is no longer eligible.
     """
     from hermes_cli import kanban_db as kb
 
-    if type(expected_handoff_event_id) is not int or type(final_pr) is not bool:
+    if type(expected_handoff_event_id) is not int or (badge is not None and not _valid_badge(badge)):
         return False
+    if badge is not None:
+        badge = {"label": badge["label"].strip(), "tone": badge["tone"]}
     with kb.write_txn(conn):
         task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if task is None:
@@ -77,7 +85,7 @@ def set_review_attention(conn: sqlite3.Connection, task_id: str, *,
         if (not attention or attention["kind"] != "awaiting-test"
                 or attention["handoff_event_id"] != expected_handoff_event_id):
             return False
-        if attention.get("final_pr", False) != final_pr:
+        if attention.get("badge") != badge:
             kb._append_event(conn, task_id, "review_attention", {
-                "handoff_event_id": expected_handoff_event_id, "final_pr": final_pr}, run_id=attention["run_id"])
+                "handoff_event_id": expected_handoff_event_id, "badge": badge}, run_id=attention["run_id"])
     return True

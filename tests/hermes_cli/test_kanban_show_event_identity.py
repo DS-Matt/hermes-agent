@@ -30,5 +30,5 @@ def test_show_preserves_event_identity_for_current_review(monkeypatch):
     with connect_closing() as conn:
         assert (kb.get_task(conn, task_id), kb.list_runs(conn, task_id), kb.list_events(conn, task_id)) == before
         assert set_review_attention(
-            conn, task_id, expected_handoff_event_id=handoff["id"], final_pr=True,
+            conn, task_id, expected_handoff_event_id=handoff["id"], badge={"label": "Acceptance ready", "tone": "success"},
         )

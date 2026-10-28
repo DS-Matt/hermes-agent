@@ -7,7 +7,7 @@ import { registerPluginLocales } from '@/i18n/plugin-i18n'
 
 import { en, KANBAN_LOCALES } from './i18n'
 import type { KanbanTask } from './types'
-import { isFinalPr, TaskAttention } from './ui'
+import { TaskAttention } from './ui'
 
 let disposeLocales: () => void
 beforeEach(() => {
@@ -61,33 +61,45 @@ describe('current task attention', () => {
   })
 })
 
-describe('selected final PR attention', () => {
-  it('keeps the testing label and adds Final PR in card and drawer', () => {
-    const selected = { ...task, current_attention: { kind: 'awaiting-test' as const, run_id: 9, final_pr: true } }
+describe('producer review badge', () => {
+  it('replaces the testing label with one green badge in card and drawer', () => {
+    const selected = { ...task, current_attention: {
+      kind: 'awaiting-test' as const, run_id: 9, badge: { label: 'Final PR', tone: 'success' as const }
+    } }
+
     const { rerender } = render(<TaskAttention task={selected} />)
-    expect(screen.getByText(en.attention['awaiting-test'])).toBeTruthy()
-    expect(screen.getByText(en.finalPr)).toBeTruthy()
-    expect(isFinalPr(selected)).toBe(true)
+    expect(screen.queryByText(en.attention['awaiting-test'])).toBeNull()
+    expect(screen.getAllByText('Final PR')).toHaveLength(1)
+    expect(screen.getByText('Final PR').className).toContain('text-emerald-600')
     rerender(<TaskAttention detail task={selected} />)
-    expect(screen.getByText(en.finalPr)).toBeTruthy()
+    expect(screen.getAllByText('Final PR')).toHaveLength(1)
     rerender(<TaskAttention task={{ ...selected, status: 'ready' }} />)
-    expect(screen.queryByText(en.finalPr)).toBeNull()
-    expect(isFinalPr({ ...selected, status: 'ready' })).toBe(false)
+    expect(screen.queryByText('Final PR')).toBeNull()
   })
 
-  it.each(['awaiting-answer', 'run-failed'] as const)('does not highlight %s even with a stale marker', kind => {
-    const stale = { ...task, current_attention: { kind, run_id: 9, final_pr: true } }
-    render(<TaskAttention task={stale} />)
-    expect(screen.queryByText(en.finalPr)).toBeNull()
-    expect(isFinalPr(stale)).toBe(false)
+  it.each(['awaiting-answer', 'run-failed'] as const)('does not replace %s with a stale badge', kind => {
+    render(<TaskAttention task={{ ...task, current_attention: {
+      kind, run_id: 9, badge: { label: 'Old approval', tone: 'success' }
+    } }} />)
+    expect(screen.queryByText('Old approval')).toBeNull()
+    expect(screen.getByText(en.attention[kind])).toBeTruthy()
   })
 
-  it('keeps approved Drafts and older backends unhighlighted', () => {
-    const draft = { ...task, current_attention: { kind: 'awaiting-test' as const, run_id: 9 } }
-    render(<TaskAttention task={draft} />)
-    expect(screen.getByText(en.attention['awaiting-test'])).toBeTruthy()
-    expect(screen.queryByText(en.finalPr)).toBeNull()
-    expect(isFinalPr(draft)).toBe(false)
-    expect(isFinalPr(task)).toBe(false)
+  it.each([
+    ['awaiting-test', 'text-blue-600'], ['awaiting-answer', 'text-amber-600'], ['run-failed', 'text-destructive']
+  ] as const)('uses the default color for %s', (kind, color) => {
+    render(<TaskAttention task={{ ...task, current_attention: { kind, run_id: 9 } }} />)
+    expect(screen.getByText(en.attention[kind]).className).toContain(color)
+  })
+
+  it('renders arbitrary producer wording as plain text', () => {
+    const label = '<img src=x onerror=alert(1)>'
+
+    const { container } = render(<TaskAttention task={{ ...task, current_attention: {
+      kind: 'awaiting-test', run_id: 9, badge: { label, tone: 'info' }
+    } }} />)
+
+    expect(screen.getByText(label)).toBeTruthy()
+    expect(container.querySelector('img')).toBeNull()
   })
 })

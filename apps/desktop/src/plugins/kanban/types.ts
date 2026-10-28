@@ -18,7 +18,7 @@ export interface KanbanTask {
     kind: 'awaiting-answer' | 'awaiting-test' | 'run-failed'
     run_id: number
     handoff_event_id?: number
-    final_pr?: boolean
+    badge?: { label: string; tone: 'success' | 'info' | 'warning' | 'danger' }
     summary?: null | string
   }
   comment_count?: number

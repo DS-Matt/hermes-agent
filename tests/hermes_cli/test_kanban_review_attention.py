@@ -1,4 +1,4 @@
-"""Final PR is a handoff-scoped display assertion, never a lifecycle transition."""
+"""A producer badge is handoff-scoped display, never a lifecycle transition."""
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -32,15 +32,15 @@ def projection(conn, tid):
 def test_set_repeat_clear_preserve_task_and_review_provenance(board):
     tid, eid = handoff(board)
     before = kb.get_task(board, tid), kb.list_runs(board, tid)
-    assert set_review_attention(board, tid, expected_handoff_event_id=eid, final_pr=True)
-    assert projection(board, tid)['final_pr'] is True
+    assert set_review_attention(board, tid, expected_handoff_event_id=eid, badge={'label': 'Acceptance ready', 'tone': 'success'})
+    assert projection(board, tid)['badge'] == {'label': 'Acceptance ready', 'tone': 'success'}
     assert projection(board, tid)['handoff_event_id'] == eid
     count = len(kb.list_events(board, tid))
-    assert set_review_attention(board, tid, expected_handoff_event_id=eid, final_pr=True)
+    assert set_review_attention(board, tid, expected_handoff_event_id=eid, badge={'label': 'Acceptance ready', 'tone': 'success'})
     assert len(kb.list_events(board, tid)) == count
-    assert set_review_attention(board, tid, expected_handoff_event_id=eid, final_pr=False)
-    assert 'final_pr' not in projection(board, tid)
-    assert set_review_attention(board, tid, expected_handoff_event_id=eid, final_pr=False)
+    assert set_review_attention(board, tid, expected_handoff_event_id=eid, badge=None)
+    assert 'badge' not in projection(board, tid)
+    assert set_review_attention(board, tid, expected_handoff_event_id=eid, badge=None)
     assert len(kb.list_events(board, tid)) == count + 1
     assert (kb.get_task(board, tid), kb.list_runs(board, tid)) == before
 
@@ -61,28 +61,54 @@ def test_setter_rejects_noncurrent_testing_handoff(board, case):
         board.execute('UPDATE task_events SET run_id=NULL WHERE id=?', (eid,))
         board.commit()
     before = kb.get_task(board, tid), kb.list_runs(board, tid), kb.list_events(board, tid)
-    assert not set_review_attention(board, tid, expected_handoff_event_id=eid + (case == 'stale'), final_pr=True)
+    assert not set_review_attention(board, tid, expected_handoff_event_id=eid + (case == 'stale'), badge={'label': 'Acceptance ready', 'tone': 'success'})
     assert (kb.get_task(board, tid), kb.list_runs(board, tid), kb.list_events(board, tid)) == before
 
 
 def test_same_second_reopen_and_new_review_cannot_reuse_marker(board, monkeypatch):
     monkeypatch.setattr(kb.time, 'time', lambda: 1000)
     tid, eid = handoff(board)
-    assert set_review_attention(board, tid, expected_handoff_event_id=eid, final_pr=True)
+    assert set_review_attention(board, tid, expected_handoff_event_id=eid, badge={'label': 'Acceptance ready', 'tone': 'success'})
     assert kb.reopen_review_task(board, tid)
     assert projection(board, tid) is None
     run = kb.claim_task(board, tid)
     assert kb.request_review(board, tid, expected_run_id=run.current_run_id, metadata={'wait_reason': 'awaiting-test'})
-    assert 'final_pr' not in projection(board, tid)
-    assert not set_review_attention(board, tid, expected_handoff_event_id=eid, final_pr=True)
+    assert 'badge' not in projection(board, tid)
+    assert not set_review_attention(board, tid, expected_handoff_event_id=eid, badge={'label': 'Acceptance ready', 'tone': 'success'})
 
 
-@pytest.mark.parametrize('payload', ['{broken', '[]', '{"final_pr":"future"}', '{"final_pr":true,"handoff_event_id":false}'])
+@pytest.mark.parametrize('payload', ['{broken', '[]', '{"badge":"future"}', '{"badge":{},"handoff_event_id":false}'])
 def test_bad_latest_marker_fails_closed_without_reviving_old_set(board, payload):
     tid, eid = handoff(board)
-    assert set_review_attention(board, tid, expected_handoff_event_id=eid, final_pr=True)
+    assert set_review_attention(board, tid, expected_handoff_event_id=eid, badge={'label': 'Acceptance ready', 'tone': 'success'})
     with kb.write_txn(board):
         kb._append_event(board, tid, 'review_attention', {}, run_id=kb.latest_run(board, tid).id)
         board.execute('UPDATE task_events SET payload=? WHERE id=(SELECT MAX(id) FROM task_events)', (payload,))
     attention = projection(board, tid)
-    assert attention['kind'] == 'awaiting-test' and 'final_pr' not in attention
+    assert attention['kind'] == 'awaiting-test' and 'badge' not in attention
+
+
+@pytest.mark.parametrize('badge', [False, 'label', {}, {'label': ' ', 'tone': 'info'},
+    {'label': 'x' * 81, 'tone': 'info'}, {'label': 'Ready', 'tone': 'arbitrary-css'},
+    {'label': 'Ready', 'tone': []}])
+def test_invalid_badge_does_not_mutate_current_handoff(board, badge):
+    tid, eid = handoff(board)
+    before = kb.list_events(board, tid)
+    assert not set_review_attention(board, tid, expected_handoff_event_id=eid, badge=badge)
+    assert kb.list_events(board, tid) == before
+
+
+@pytest.mark.parametrize('tone', ['success', 'info', 'warning', 'danger'])
+def test_producer_label_and_tone_survive_projection(board, tone):
+    tid, eid = handoff(board)
+    badge = {'label': '<b>Release acceptance</b>', 'tone': tone}
+    assert set_review_attention(board, tid, expected_handoff_event_id=eid, badge=badge)
+    assert projection(board, tid)['badge'] == badge
+
+
+def test_legacy_project_marker_is_not_reinterpreted(board):
+    tid, eid = handoff(board)
+    with kb.write_txn(board):
+        kb._append_event(board, tid, 'review_attention', {'handoff_event_id': eid, 'final_pr': True},
+                         run_id=kb.latest_run(board, tid).id)
+    assert 'badge' not in projection(board, tid)
