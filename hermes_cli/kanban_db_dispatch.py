@@ -1561,7 +1561,7 @@ def check_respawn_guard(
 
     Infrastructure and rate-limit cooldowns precede auth: neutral quota
     retries retain an error stamp. Later progress supersedes only a proven
-    quota stamp, never an unmatched current auth error; budgets stay intact.
+    historical quota/crash stamp, never an unmatched current auth error; budgets stay intact.
     Ready-only ``recent_success`` and ``active_pr`` prevent duplicate work;
     later explicit requeue/handoff events override their respective guards.
     Review skips these last two because success and a PR are its inputs.
@@ -1612,14 +1612,14 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    # Successful handoffs supersede a proven quota stamp, not a fresh auth
+    # Successful handoffs supersede a matching historical stamp, not a fresh auth
     # error (PR acceptance can write one without ending another run).
-    superseded_quota = err and latest_outcome in {"review_requested", "changes_requested", "completed"} and conn.execute(
-        "SELECT 1 FROM task_runs WHERE task_id=? AND outcome='rate_limited' "
+    superseded_failure = err and latest_outcome in {"review_requested", "changes_requested", "completed"} and conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id=? AND outcome IN ('rate_limited', 'crashed') "
         "AND id<? AND ended_at<=? AND substr(error,1,500)=? LIMIT 1",
         (task_id, latest_run["id"], latest_run["ended_at"], err),
     ).fetchone()
-    if err and latest_outcome != "crashed" and not superseded_quota and _RESPAWN_BLOCKER_RE.search(err):
+    if err and latest_outcome != "crashed" and not superseded_failure and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL

@@ -1,4 +1,4 @@
-"""A successful handoff supersedes a proven quota stamp, not a fresh auth error.
+"""A successful handoff supersedes a proven failure stamp, not a fresh auth error.
 
 Regression for upstream #138618; builds on the read-side approach in #137833.
 """
@@ -12,26 +12,27 @@ from hermes_cli.kanban_pr_acceptance_store import record_acceptance
 QUOTA = "pid 42 exited rate-limited (quota wall) — requeued without counting a failure"
 
 
-@pytest.fixture
-def recovered(tmp_path, monkeypatch):
+@pytest.fixture(params=["rate_limited", "crashed"])
+def recovered(tmp_path, monkeypatch, request):
+    error = QUOTA if request.param == "rate_limited" else ('pid 42 exited with code 1: billing in old output; ' + 'x' * 600)
     monkeypatch.setattr(kb.time, "time", lambda: 5_000_000)
     with kbc.connect(tmp_path / "kanban.db") as conn:
-        tid = kb.create_task(conn, title="Recovered quota", assignee="builder")
+        tid = kb.create_task(conn, title="Recovered failure", assignee="builder")
         kb.claim_task(conn, tid)
-        kb._end_run(conn, tid, outcome="rate_limited", error=QUOTA)
+        kb._end_run(conn, tid, outcome=request.param, error=error)
         conn.execute(
             "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
             "worker_pid=NULL, last_failure_error=?, consecutive_failures=2, "
-            "block_recurrences=1 WHERE id=?", (QUOTA, tid),
+            "block_recurrences=1 WHERE id=?", (error[:500], tid),
         )
         conn.commit()
         monkeypatch.setattr(kb.time, "time", lambda: 5_000_001)
-        yield conn, tid
+        yield conn, tid, error[:500]
 
 
 @pytest.mark.parametrize("reviewer,same_second", [("builder", False), ("reviewer", False), ("reviewer", True)])
-def test_successful_handoff_releases_stale_quota_without_changing_accounting(recovered, reviewer, same_second, monkeypatch):
-    conn, tid = recovered
+def test_successful_handoff_releases_stale_failure_without_changing_accounting(recovered, reviewer, same_second, monkeypatch):
+    conn, tid, error = recovered
     if same_second:
         monkeypatch.setattr(kb.time, "time", lambda: 5_000_000)
     claimed = kb.claim_task(conn, tid)
@@ -40,7 +41,7 @@ def test_successful_handoff_releases_stale_quota_without_changing_accounting(rec
     before = tuple(conn.execute(
         "SELECT consecutive_failures, block_recurrences, last_failure_error FROM tasks WHERE id=?", (tid,),
     ).fetchone())
-    assert before == (2, 1, QUOTA)
+    assert before == (2, 1, error)
     # The newer run owns current state, including equal-timestamp handoffs.
     assert kbd.check_respawn_guard(conn, tid, lane="review") is None
     assert tuple(conn.execute(
@@ -53,8 +54,8 @@ def test_successful_handoff_releases_stale_quota_without_changing_accounting(rec
     ("completed", "recent_success"), ("spawn_failed", "blocker_auth"),
     ("failed", "blocker_auth"), ("blocked", "blocker_auth"),
 ])
-def test_only_successful_newer_run_supersedes_matching_quota(recovered, outcome, expected):
-    conn, tid = recovered
+def test_only_successful_newer_run_supersedes_matching_failure(recovered, outcome, expected):
+    conn, tid, _error = recovered
     kb.claim_task(conn, tid)
     kb._end_run(conn, tid, outcome=outcome)
     assert kbd.check_respawn_guard(conn, tid) == expected
@@ -62,7 +63,7 @@ def test_only_successful_newer_run_supersedes_matching_quota(recovered, outcome,
 
 @pytest.mark.parametrize("current_error", ["acceptance", "unmatched", "unproven"])
 def test_successful_handoff_does_not_suppress_current_auth_error(recovered, current_error):
-    conn, tid = recovered
+    conn, tid, _error = recovered
     claimed = kb.claim_task(conn, tid)
     assert kb.request_review(conn, tid, reviewer="reviewer", summary="Ready",
                              expected_run_id=claimed.current_run_id)
@@ -73,7 +74,7 @@ def test_successful_handoff_does_not_suppress_current_auth_error(recovered, curr
             {"ok": False, "classification": "auth", "detail": "authentication failed", "recovery": "login"},
         ))
     elif current_error == "unproven":
-        conn.execute("UPDATE task_runs SET error=NULL WHERE task_id=? AND outcome='rate_limited'", (tid,))
+        conn.execute("UPDATE task_runs SET error=NULL WHERE task_id=? AND outcome IN ('rate_limited', 'crashed')", (tid,))
     else:
         conn.execute("UPDATE tasks SET last_failure_error='provider authentication failed' WHERE id=?", (tid,))
     conn.commit()
