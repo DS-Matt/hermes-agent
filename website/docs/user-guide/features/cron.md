@@ -684,6 +684,27 @@ cron:
   wrap_response: false
 ```
 
+For a script-only (`no_agent`) job, you can also give failure alerts a readable
+title and a short explanation of what the job does:
+
+```yaml
+cron:
+  wrap_response: false
+  failure_context:
+    backup-check:
+      title: Backup verification
+      description: Hermes was checking whether the latest backup completed.
+```
+
+These alerts put the explanation and next step above a copyable technical section
+containing the job identity, error excerpt and run-history command. Full diagnostics
+remain in the saved run output. This changes presentation only; schedules, retries,
+failure reminders and delivery routing retain their existing behavior.
+`wrap_response` applies to every job in the profile. Context entries match job names;
+jobs with the same name share the entry, and renamed/unconfigured jobs keep the default
+failure format. Both `title` and `description` must be nonempty strings. Invalid entries
+fall back to the default format.
+
 ### Push notifications (`cron.delivery.notify`)
 
 Cron output is a *final* delivery, not a progress message, so by default it is

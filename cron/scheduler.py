@@ -134,22 +134,12 @@ def _failure_streak_nudge(job: dict) -> str:
     """Review nudge when a recurring job keeps failing, else "". The failure message is delivered
     BEFORE mark_job_run records this run, hence stored ``failure_streak`` + 1. Threshold:
     ``cron.failure_nudge_threshold`` (default 3, 0 disables)."""
-    schedule_kind = (job.get("schedule") or {}).get("kind")
-    if schedule_kind not in {"cron", "interval"}:
-        return ""
-    try:
-        cfg = load_config() or {}
-        threshold = int(
-            ((cfg.get("cron") or {}) if isinstance(cfg, dict) else {}).get(
-                "failure_nudge_threshold", 3
-            )
-        )
-    except Exception:
-        threshold = 3
-    if threshold <= 0:
-        return ""
-    streak = int(job.get("failure_streak") or 0) + 1  # +1 = this run
-    if streak < threshold:
+    from cron.scheduler_failure_copy import failure_streak_for_notice, script_failure_context
+
+    if script_failure_context(job):
+        return ""  # The configured notice places this warning above its technical block.
+    streak = failure_streak_for_notice(job)
+    if not streak:
         return ""
     job_ref = job.get("name") or job.get("id") or "this job"
     return (
@@ -261,12 +251,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     ``classify_api_error`` verdict and the copy table in ``scheduler_failure_copy``."""
     from cron.scheduler_failure_copy import (
         classify_cron_failure_reason, generic_failure_notice, inactivity_notice,
-        provider_failure_notice, script_timeout_notice)
+        provider_failure_notice, readable_script_failure_notice, script_failure_context,
+        script_timeout_notice)
 
     job_name = job.get("name") or job.get("id") or "cron job"
     job_id = job.get("id") or job_name
     text = (error or "unknown error").strip()
     lower = text.lower()
+
+    context = script_failure_context(job)
+    if context:
+        return readable_script_failure_notice(job, text, context)
 
     # Script runner contract ("Script timed out after {n}s: {path}") — also for agent jobs with a
     # context script. Must precede provider classification so it never claims a model failure.

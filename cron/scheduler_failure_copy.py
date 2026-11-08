@@ -9,9 +9,96 @@ the real output directory — "cron output" alone sent operators hunting.
 from __future__ import annotations
 
 import re
+import shlex
 from typing import Any, Optional
 
 from hermes_constants import display_hermes_home
+
+
+def script_failure_context(job: dict) -> Optional[dict[str, str]]:
+    """Optional display copy for a named script job; never changes execution policy."""
+    if not job.get("no_agent"):
+        return None
+    from cron import scheduler
+
+    try:
+        cfg = scheduler.load_config() or {}
+    except (OSError, ValueError, TypeError):
+        return None  # A broken display configuration must not break failure delivery.
+    cron = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+    contexts = cron.get("failure_context", {}) if isinstance(cron, dict) else {}
+    context = contexts.get(job.get("name")) if isinstance(contexts, dict) else None
+    if not isinstance(context, dict):
+        return None
+    if not all(isinstance(context.get(key), str) and context[key].strip() for key in ("title", "description")):
+        return None
+    return context
+
+
+def failure_streak_for_notice(job: dict) -> int:
+    """Return the existing reminder count, including this run before bookkeeping."""
+    if (job.get("schedule") or {}).get("kind") not in {"cron", "interval"}:
+        return 0
+    from cron import scheduler
+
+    try:
+        cfg = scheduler.load_config() or {}
+        threshold = int(((cfg.get("cron") or {}) if isinstance(cfg, dict) else {}).get("failure_nudge_threshold", 3))
+    except (OSError, ValueError, TypeError, AttributeError):
+        threshold = 3
+    streak = int(job.get("failure_streak") or 0) + 1
+    return streak if threshold > 0 and streak >= threshold else 0
+
+
+def _script_next_step(job: dict) -> str:
+    from cron.jobs import is_job_runnable
+
+    repeat = job.get("repeat") or {}
+    remaining = not repeat.get("times") or int(repeat.get("completed") or 0) + 1 < int(repeat["times"])
+    scheduled = ((job.get("schedule") or {}).get("kind") in {"cron", "interval"}
+                 and is_job_runnable(job) and job.get("state") != "error" and remaining
+                 and not job.get("_quota_hold_seconds"))
+    if scheduled:
+        return "Hermes will try again at the next scheduled check."
+    return "No automatic retry is confirmed. Ask an agent to investigate using the details below."
+
+
+def readable_script_failure_notice(job: dict, error: str, context: dict[str, str]) -> str:
+    """Human context first; a bounded diagnostic excerpt remains copyable below it."""
+    from hermes_constants import profile_cli_selector
+    from cron.scheduler_delivery import _redact_cron_payload
+
+    # Redact before taking excerpts: clipping a credential can defeat its recognizer.
+    title = re.sub(r"\s+", " ", _redact_cron_payload(context["title"], "failure title")).strip()[:160]
+    description = _redact_cron_payload(context["description"], "failure description").strip()[:400]
+    error = _redact_cron_payload(error, "failure diagnostics")
+    # Translate only this explicit transport symptom, not generic network/service errors
+    # (which could be an HTTP failure). No provider classification or retry policy changes.
+    if "Remote end closed connection without response" in error:
+        cause = "A remote connection closed before responding, so this check could not finish. The reason for the disconnect is unknown."
+    elif error.lower().startswith("script timed out"):
+        cause = "The check exceeded its time limit and was stopped before it finished."
+    else:
+        cause = "An error prevented this check from finishing. The technical details below show what was reported."
+    next_step = _script_next_step(job)
+    streak = failure_streak_for_notice(job)
+    if streak:
+        next_step += f" This check has failed {streak} times in a row; ask an agent to investigate."
+    if len(error) > 1800:
+        error = error[:200] + "\n[Diagnostic excerpt; full output is in the run log.]\n" + error[-1500:]
+    # Fences inside stderr must not turn diagnostic text into message sections/links.
+    job_id = str(job.get("id") or "unknown")
+    command = f"hermes {profile_cli_selector()}cron runs {shlex.quote(job_id)}"
+    diagnostics = (f"Job: {job.get('name') or 'unnamed'}\nJob ID: {job_id}\n{error}\n"
+                   f"Run history: {command}").replace("```", "[triple-backtick fence]")
+    return (
+        f"⚠️ **{title} — could not finish**\n\n"
+        f"**What was happening**\n{description}\n\n"
+        f"**What went wrong**\n{cause}\n\n"
+        f"**Next step**\n{next_step}\n\n"
+        f"**Technical details — copy for troubleshooting**\n```text\n"
+        f"{diagnostics}\n```"
+    )
 
 
 def cron_output_dir_display(job_id: str) -> str:
