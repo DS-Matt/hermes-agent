@@ -14,6 +14,9 @@ _REAL_INSTALL_COMMAND = runtime.install_command  # captured before the fixture p
 
 @pytest.fixture(autouse=True)
 def _isolated_host(tmp_path, monkeypatch):
+    real_which = install.shutil.which
+    monkeypatch.setattr(install.shutil, "which", lambda name, *args, **kwargs:
+                        "/test-owned/sudo" if name == "sudo" else real_which(name, *args, **kwargs))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(install, "_sudo_nopasswd", lambda: False)
     monkeypatch.setattr(runtime, "is_supported_host", lambda: True)
