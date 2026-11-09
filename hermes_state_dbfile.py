@@ -234,9 +234,9 @@ _DARWIN_LIBPROC = None
 
 # Wall-clock budget for one darwin holder-scan pass (#113187). A single
 # proc_pidfdinfo call can block uninterruptibly in the kernel (a process stuck
-# in uninterruptible I/O on a dead network share), so no per-iteration check
-# can bound it: the whole pass runs in a daemon thread and is abandoned on
-# expiry, failing open per the guard's contract.
+# in uninterruptible I/O on a dead network share), so loop checks cannot bound
+# that call. The daemon bounds the caller's wait; cooperative cancellation
+# stops an expired scan that is still progressing. Expiry remains fail-open.
 _DARWIN_FD_SCAN_TIMEOUT_SECONDS = 5.0
 
 
@@ -277,7 +277,7 @@ def _darwin_all_pids(lib) -> list[int]:
         size *= 2
 
 
-def _iter_darwin_fd_targets():
+def _iter_darwin_fd_targets(*, cancelled: threading.Event | None = None):
     """Yield ``(pid, fd, last pathname, (st_dev, st_ino))`` for every vnode fd libproc reports.
 
     The pathname and the identity both stay readable after the path is unlinked, which is what
@@ -285,10 +285,16 @@ def _iter_darwin_fd_targets():
     (gone, or not ours) and descriptors that are not vnodes are skipped silently."""
     import ctypes
 
+    if cancelled is not None and cancelled.is_set():
+        return
     lib = _darwin_libproc()
     for pid in _darwin_all_pids(lib):
+        if cancelled is not None and cancelled.is_set():
+            return
         size = 4096
         while True:
+            if cancelled is not None and cancelled.is_set():
+                return
             listing = ctypes.create_string_buffer(size)
             used = lib.proc_pidinfo(pid, _DARWIN_PIDLISTFDS, 0, listing, size)
             if used <= 0:
@@ -299,11 +305,15 @@ def _iter_darwin_fd_targets():
         else:
             continue
         for offset in range(0, used - _DARWIN_PROC_FD_INFO_SIZE + 1, _DARWIN_PROC_FD_INFO_SIZE):
+            if cancelled is not None and cancelled.is_set():
+                return
             fd = struct.unpack_from("<i", listing.raw, offset)[0]
             record = ctypes.create_string_buffer(_DARWIN_FD_RECORD_SIZE)
             if lib.proc_pidfdinfo(pid, fd, _DARWIN_PIDFDVNODEPATHINFO, record,
                                   _DARWIN_FD_RECORD_SIZE) <= 0:
                 continue
+            if cancelled is not None and cancelled.is_set():
+                return
             raw = record.raw
             identity = (struct.unpack_from("<I", raw, _DARWIN_FD_DEV_OFFSET)[0],
                         struct.unpack_from("<Q", raw, _DARWIN_FD_INO_OFFSET)[0])
@@ -324,23 +334,25 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
     holders: list[tuple[int, str]] = []
     errors: list[BaseException] = []
+    cancelled = threading.Event()
 
     def _scan() -> None:
         try:
-            for pid, _fd, target, identity in _iter_darwin_fd_targets():
+            for pid, _fd, target, identity in _iter_darwin_fd_targets(cancelled=cancelled):
                 literal = watched.get(target.casefold())
                 if literal is not None and _identity_is_truly_unlinked(identity, literal):
                     holders.append((pid, target))
         except BaseException as exc:
             errors.append(exc)
 
-    # ponytail: abandoned daemon thread per timed-out scan; a kernel-blocked
-    # proc_pidfdinfo cannot be interrupted, so expiry leaks one thread that
-    # dies with the process. Fail open: partial/empty holders, never a refusal.
+    # ponytail: cancellation stops progressing scans, but cannot interrupt a
+    # kernel-blocked call. That daemon remains until the call returns or the
+    # process exits. Fail open: partial/empty holders, never a refusal.
     worker = threading.Thread(target=_scan, daemon=True)
     worker.start()
     worker.join(_DARWIN_FD_SCAN_TIMEOUT_SECONDS)
     if worker.is_alive():
+        cancelled.set()
         logger.warning(
             "deleted-WAL holder scan timed out after %.1fs for %s; continuing fail-open",
             _DARWIN_FD_SCAN_TIMEOUT_SECONDS,

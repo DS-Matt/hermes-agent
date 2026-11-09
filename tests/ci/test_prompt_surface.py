@@ -15,6 +15,8 @@ import importlib.util
 import shutil
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 _spec = importlib.util.spec_from_file_location("prompt_surface", REPO / "scripts" / "ci" / "prompt_surface.py")
 assert _spec is not None and _spec.loader is not None
@@ -60,3 +62,44 @@ def test_summary_names_the_surface_and_tool_that_changed(tmp_path):
     assert "| cli.claude |" in summary and "+# Finish every job" in summary
     assert "`write_file`: description +" in summary
     assert prompt_surface.summarize(base, base) == ""
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_renderer_pins_skill_eligibility_without_changing_host(tmp_path):
+    """HH464: both skill index paths use target data on the real interpreter."""
+    import subprocess
+    import sys
+
+    code = r'''
+import runpy
+import sys
+from pathlib import Path
+
+import pytest
+native_platform = sys.platform
+surface = runpy.run_path(sys.argv[1])
+surface["_pin_environment"]()
+assert sys.platform == native_platform
+import sysconfig
+assert sysconfig.get_config_var("EXT_SUFFIX")
+from agent import skill_utils, prompt_builder
+assert Path(skill_utils.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve().parents[2])
+skills = Path(sys.argv[2]) / "skills"
+for name, platform in (("linux-only-proof", "linux"), ("mac-only-proof", "darwin")):
+    folder = skills / name
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Target platform proof\nplatforms: [{platform}]\n---\nInstructions\n"
+    )
+for _ in range(2):
+    text = prompt_builder.build_skills_system_prompt(skills_dir_override=skills)
+    assert "linux-only-proof" in text
+    assert "mac-only-proof" not in text
+    prompt_builder.clear_skills_system_prompt_cache()
+assert sys.platform == native_platform
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(REPO / "scripts/ci/prompt_surface.py"), str(tmp_path)],
+        cwd=REPO, capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

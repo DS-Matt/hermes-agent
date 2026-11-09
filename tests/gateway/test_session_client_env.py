@@ -2,6 +2,7 @@
 (``client_env``) and apply to that session only; an auto-started gateway stops inheriting them from
 whichever client started it."""
 import json
+import os
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -305,6 +306,13 @@ async def test_a_copied_staged_receipt_is_never_judged_by_its_own_filtered_map(t
         owner.db.close()
 
 
+def _path_without_launcher_prefix(path):
+    from tools.environments.local import _resolve_hermes_bin_dir
+    entries = path.split(os.pathsep)
+    launcher = _resolve_hermes_bin_dir()
+    return entries[1:] if launcher and entries[0] == launcher else entries
+
+
 @pytest.mark.asyncio
 async def test_configured_toolchain_names_a_local_client_omitted_never_leak_from_the_daemon(tmp_path, monkeypatch):
     """Client A exported a configured extra (``terminal.client_env_passthrough``) and auto-started the
@@ -325,7 +333,7 @@ async def test_configured_toolchain_names_a_local_client_omitted_never_leak_from
             envs = (_make_run_env({}), ProcessRegistry._spawn_env({}), _build_child_env(
                 rpc_endpoint='s', rpc_token='t', tmpdir=str(tmp_path), child_python=sys.executable))
             backend = _make_run_env({'GEM_HOME': '/configured'})['GEM_HOME']  # terminal.env still wins
-        return [env.get('GEM_HOME') for env in envs], envs[0]['PATH'].split(':')[0], backend
+        return [env.get('GEM_HOME') for env in envs], _path_without_launcher_prefix(envs[0]['PATH'])[0], backend
     try:
         _, mine = _create(owner, connection.actor, home, 'a', client_env={'GEM_HOME': '/a', 'PATH': '/client/bin'})
         _, other = _create(owner, connection.actor, home, 'b', client_env={'PATH': '/client/bin'})
@@ -378,7 +386,7 @@ async def test_host_values_apply_only_over_a_gateway_proven_local_attach(tmp_pat
         policy = restore_policy(local_receipt(owner.db, ref.session_id)['policy'])
         with policy_scope(policy, authority=owner):
             run = _make_run_env({})
-            seen = (run['PATH'].split(':')[0], run.get('NVM_DIR'), _turn_prompt(owner, policy),
+            seen = (_path_without_launcher_prefix(run['PATH'])[0], run.get('NVM_DIR'), _turn_prompt(owner, policy),
                     resolve_requested_provider())
         return policy, seen, session_prefill(owner, policy, ref.session_id), local_session_info(owner, ref)
     try:

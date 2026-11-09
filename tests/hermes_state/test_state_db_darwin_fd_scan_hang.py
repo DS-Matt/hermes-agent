@@ -9,7 +9,8 @@ one stuck unrelated process froze every Hermes start indefinitely.
 ``_iter_darwin_sidecar_holders`` must therefore bound the whole pass with a
 wall-clock deadline (a per-iteration check cannot fire while blocked inside a
 single call) and fail open with a warning. libproc is faked throughout, so
-these run on every platform.
+these run on every platform. An expired scan that resumes making progress
+must stop before enumerating more descriptors.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ import os
 import struct
 import threading
 import time
+
+import pytest
 
 import hermes_state_dbfile as dbfile
 from hermes_state_dbfile import (
@@ -119,3 +122,59 @@ def test_healthy_scan_still_reports_holder(monkeypatch, tmp_path, caplog):
     assert not any(
         "timed out" in record.getMessage() for record in caplog.records
     ), "a successful scan must not log a timeout warning"
+
+
+@pytest.mark.parametrize("vnode", [False, True])
+def test_expired_scan_stops_when_its_native_call_returns(monkeypatch, tmp_path, caplog, vnode):
+    """An obsolete finite scan must not keep enumerating the host after expiry (HH465)."""
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+    target = os.path.realpath(str(tmp_path / "state.db-wal"))
+
+    class FiniteLibproc(_HealthyLibproc):
+        def proc_pidinfo(self, pid, flavor, arg, buf, size):
+            payload = struct.pack("<iIiI", 7, 1, 8, 1)
+            ctypes.memmove(buf, payload, len(payload))
+            return len(payload)
+
+        def proc_pidfdinfo(self, pid, fd, flavor, record, size):
+            calls.append((pid, fd))
+            if len(calls) == 1:
+                entered.set()
+                release.wait(HANG_GUARD)
+            return super().proc_pidfdinfo(pid, fd, flavor, record, size) if vnode else 0
+
+    original = dbfile._iter_darwin_fd_targets
+
+    def observe(*args, **kwargs):
+        try:
+            yield from original(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(dbfile, "_iter_darwin_fd_targets", observe)
+    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: FiniteLibproc(target, (0xDEAD, 0xBEEF)))
+    monkeypatch.setattr(dbfile, "_darwin_all_pids", lambda _lib: [4242, 4243])
+    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", BUDGET)
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
+            assert _iter_darwin_sidecar_holders(tmp_path / "state.db") == []
+        assert entered.is_set(), "worker never entered the controlled native call"
+        assert any("timed out" in record.getMessage() for record in caplog.records)
+    finally:
+        release.set()
+        assert finished.wait(HANG_GUARD), "finite scan did not finish after release"
+    assert calls == [(4242, 7)], "expired scan continued enumerating descriptors or PIDs"
+
+
+def test_completed_scan_propagates_its_error(monkeypatch, tmp_path):
+    error = RuntimeError("descriptor listing failed")
+
+    def fail(_lib):
+        raise error
+
+    monkeypatch.setattr(dbfile, "_darwin_libproc", object)
+    monkeypatch.setattr(dbfile, "_darwin_all_pids", fail)
+    with pytest.raises(RuntimeError) as result:
+        _iter_darwin_sidecar_holders(tmp_path / "state.db")
+    assert result.value is error

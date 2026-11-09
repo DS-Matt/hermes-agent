@@ -10,6 +10,7 @@ the application entry is an inert receipt.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shlex
 import shutil
@@ -47,7 +48,8 @@ def _killed_mid_write(tmp_path: Path, rel: str, committed: dict[str, str] | None
             shutil.copy2(SOURCE / f, root / f)
     for f, text in (committed or {}).items():
         (root / f).write_text(text, encoding="utf-8")
-    (root / "hermes_cli/main.py").write_text("def main():\n    print('APP_REACHED')\n    return 0\n", encoding="utf-8")
+    (root / "hermes_cli/main.py").write_text("def main():\n    print('APP_REACHED')\n    return 0\n"
+                                            "if __name__ == '__main__':\n    main()\n", encoding="utf-8")
     env = {"HOME": str(home), "HERMES_HOME": str(home / ".hermes"), "PATH": os.environ.get("PATH", ""),
            "LANG": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
     git_exe = shutil.which("git") or "git"
@@ -124,6 +126,56 @@ def test_a_launch_repairs_a_move_killed_while_writing_the_repairs_own_code(tmp_p
     assert launch.returncode == 0 and "APP_REACHED" in launch.stdout, launch.stderr
     assert (root / rel).read_bytes() == original
     assert not (root / ".git/hermes-update-pull").exists()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("query_runtime", [False, True])
+@pytest.mark.parametrize("recoverable", [False, True])
+def test_missing_owned_bootstrap_never_runs_an_editable_other_checkout(tmp_path, query_runtime, recoverable):
+    root, env, original, _launcher = _killed_mid_write(tmp_path, "hermes_bootstrap.py")
+    marker = root / ".git/hermes-update-pull"
+    if not recoverable:
+        marker.unlink()
+    # A disposable, dependency-free interpreter owns the .pth; the real minted bytes stay intact.
+    interpreter = tmp_path / "external-python"
+    subprocess.run([sys._base_executable, "-I", "-m", "venv", "--without-pip", str(interpreter)],
+                   env=env, check=True, timeout=30)
+    python = interpreter / "bin/python"
+    site = Path(subprocess.check_output([str(python), "-I", "-c",
+                                        "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                                       env=env, text=True, encoding="utf-8", timeout=30).strip())
+    sentinel = tmp_path / "FOREIGN_BOOTSTRAP_RAN"
+    foreign = tmp_path / "foreign_bootstrap.py"
+    foreign.write_text(f"open({str(sentinel)!r}, 'w', encoding='utf-8').close()\n"
+                       "raise RuntimeError('foreign bootstrap executed')\n", encoding="utf-8")
+    (site / "foreign_bootstrap_finder.py").write_text(
+        "import importlib.util, sys\n"
+        "class Finder:\n"
+        "    @classmethod\n"
+        "    def find_spec(cls, fullname, path=None, target=None):\n"
+        "        if fullname == 'hermes_bootstrap':\n"
+        f"            return importlib.util.spec_from_file_location(fullname, {str(foreign)!r})\n"
+        "sys.meta_path.append(Finder)\n", encoding="utf-8")
+    (site / "foreign-bootstrap.pth").write_text("import foreign_bootstrap_finder\n", encoding="utf-8")
+    launcher = _launchers._mint_shell_launcher("hermes", tmp_path / "bin", python,
+                                               _launchers._launcher_script("hermes", root, None))
+    assert launcher is not None
+    args = ["--print-runtime-command"] if query_runtime else []
+    launch = subprocess.run([str(launcher), *args], cwd=tmp_path, env=env, capture_output=True,
+                            text=True, encoding="utf-8", timeout=60, check=False)
+    assert not sentinel.exists(), launch.stderr
+    if not recoverable:
+        assert launch.returncode != 0
+        assert str(root / "hermes_bootstrap.py") in launch.stderr
+        assert "missing owned bootstrap" in launch.stderr
+        return
+    assert launch.returncode == 0, launch.stderr
+    assert (root / "hermes_bootstrap.py").read_bytes() == original
+    assert not marker.exists()
+    if query_runtime:
+        launch = subprocess.run(json.loads(launch.stdout), cwd=tmp_path, env=env, capture_output=True,
+                                text=True, encoding="utf-8", timeout=60, check=False)
+    assert launch.returncode == 0 and "APP_REACHED" in launch.stdout, launch.stderr
 
 
 @pytest.mark.platforms("posix")

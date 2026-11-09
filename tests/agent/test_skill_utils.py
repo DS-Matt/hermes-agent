@@ -482,3 +482,14 @@ class TestBOMToleranceSiblingSites:
         assert fm is not None
         assert fm.get("name") == "bp"
 
+
+def test_skill_platform_match_accepts_explicit_target_without_changing_native_default():
+    """HH464: target selection is data, while normal callers retain host eligibility."""
+    import sys
+
+    from agent.skill_utils import skill_matches_platform_list
+
+    assert skill_matches_platform_list([sys.platform])
+    assert skill_matches_platform_list(["linux"], current_platform="linux")
+    assert not skill_matches_platform_list(["macos"], current_platform="linux")
+    assert skill_matches_platform_list(["macos"], current_platform="darwin")
