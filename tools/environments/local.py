@@ -846,6 +846,61 @@ def _resolve_shell_init_files() -> list[str]:
     return resolved
 
 
+def _restore_login_toolchain(command: str, run_env: dict, backend_env: dict) -> tuple[str, dict]:
+    """Restore admitted POSIX toolchains after login rc files, before the first snapshot.
+
+    Values travel only in the child environment. Cached non-login commands keep their
+    saved shell exports; Windows retains MSYS's existing native PATH conversion.
+    """
+    if _IS_WINDOWS:
+        return command, run_env
+    from agent.session_client_env import tool_env
+    from tools.environments.base_session_env import _SHELL_ENV_NAME_RE
+
+    admitted = tool_env()
+    explicit_path = "PATH" in admitted or "PATH" in backend_env
+    names = sorted(name for name in admitted if name != "PATH" and name in run_env
+                   and _SHELL_ENV_NAME_RE.fullmatch(name))
+    child_env = dict(run_env)
+    child_env["_HERMES_LOGIN_PATH"] = run_env.get("PATH", "")
+    markers = ["_HERMES_LOGIN_PATH"]
+    source = '${_HERMES_LOGIN_PATH-}:${PATH-}' if explicit_path else '${PATH-}:${_HERMES_LOGIN_PATH-}'
+    lines = ['_HERMES_LOGIN_ACC=""', f'_HERMES_LOGIN_TAIL="{source}"']
+    # Explicit PATH already carries the launcher ordering. For a daemon-only PATH,
+    # keep rc priority except for the existing authoritative launcher rule.
+    launcher = _resolve_hermes_bin_dir() if not explicit_path else None
+    if launcher:
+        child_env["_HERMES_LOGIN_BIN"] = launcher
+        markers.append("_HERMES_LOGIN_BIN")
+        if _HERMES_BIN_DIR_IS_PAYLOAD:
+            lines.append('_HERMES_LOGIN_ACC="${_HERMES_LOGIN_BIN-}"')
+        else:
+            lines.append('case ":${PATH-}:" in *":${_HERMES_LOGIN_BIN-}:"*) ;; '
+                         '*) _HERMES_LOGIN_ACC="${_HERMES_LOGIN_BIN-}" ;; esac')
+    # Parameter slicing avoids rc-controlled IFS, glob expansion and external tools.
+    lines.append('''while [ -n "${_HERMES_LOGIN_TAIL-}" ]; do
+    _HERMES_LOGIN_ENTRY="${_HERMES_LOGIN_TAIL%%:*}"
+    case "$_HERMES_LOGIN_TAIL" in
+        *:*) _HERMES_LOGIN_TAIL="${_HERMES_LOGIN_TAIL#*:}" ;;
+        *) _HERMES_LOGIN_TAIL="" ;;
+    esac
+    if [ -n "$_HERMES_LOGIN_ENTRY" ]; then
+        case ":$_HERMES_LOGIN_ACC:" in
+            *":$_HERMES_LOGIN_ENTRY:"*) ;;
+            *) _HERMES_LOGIN_ACC="${_HERMES_LOGIN_ACC:+$_HERMES_LOGIN_ACC:}$_HERMES_LOGIN_ENTRY" ;;
+        esac
+    fi
+done
+builtin export PATH="$_HERMES_LOGIN_ACC"''')
+    for name in names:
+        marker = f"_HERMES_LOGIN_VALUE_{name}"
+        child_env[marker] = run_env[name]
+        markers.append(marker)
+        lines.append(f'builtin export {name}="${{{marker}-}}"')
+    lines.append('builtin unset ' + ' '.join([*markers, "_HERMES_LOGIN_ACC", "_HERMES_LOGIN_TAIL", "_HERMES_LOGIN_ENTRY"]))
+    return "\n".join([*lines, command]), child_env
+
+
 def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     """Prepend guarded, silent ``source <file>`` lines: ``set +e`` keeps going on
     errors, ``2>/dev/null`` hides noisy prompts, ``|| true`` neutralises the status."""
@@ -1099,14 +1154,24 @@ class LocalEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
+        run_env = _make_run_env(self.env)
+        if not _IS_WINDOWS:
+            from agent.session_client_env import tool_env
+            from tools.environments.base_session_env import _SHELL_ENV_NAME_RE
+
+            # export -p cannot safely round-trip non-shell names into a sourced snapshot.
+            for name in tool_env():
+                if not _SHELL_ENV_NAME_RE.fullmatch(name):
+                    run_env.pop(name, None)
         # Login invocations (init_session's env snapshot) source the user's rc /
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
         if login:
+            cmd_string, run_env = _restore_login_toolchain(cmd_string, run_env, self.env)
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
