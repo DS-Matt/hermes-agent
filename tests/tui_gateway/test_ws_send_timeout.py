@@ -10,22 +10,30 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from tui_gateway.ws import WSTransport
 
 
 class _StalledWS:
     """``send_text`` never completes (kernel backpressure); ``close`` is observable."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, release_on_close: bool = True) -> None:
         self.closed_with: list[int] = []
         self._release = asyncio.Event()
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+        self.release_on_close = release_on_close
 
     async def send_text(self, line: str) -> None:
+        self.started.set()
         await self._release.wait()
 
     async def close(self, code: int = 1000) -> None:
         self.closed_with.append(code)
-        self._release.set()
+        self.closed.set()
+        if self.release_on_close:
+            self._release.set()
 
 
 class _FastWS:
@@ -52,6 +60,30 @@ def test_stalled_send_closes_socket_and_releases_queued_reply(monkeypatch):
         assert transport.closed, "the transport must latch closed so handle_ws teardown/reconnect can run"
         await asyncio.sleep(0)  # let the scheduled close task run
         assert ws.closed_with == [1011], "the stalled socket must be closed, not left half-open"
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("abort_first", [False, True])
+def test_send_timeout_and_overflow_close_socket_once(monkeypatch, abort_first):
+    monkeypatch.setattr("tui_gateway.ws._WS_SEND_DEADLINE_S", 0.05)
+
+    async def _run() -> None:
+        # A close request need not release an already stalled send immediately.
+        ws = _StalledWS(release_on_close=False)
+        transport = WSTransport(ws, asyncio.get_running_loop())
+        progress = asyncio.create_task(transport.write_async({"id": "progress"}))
+        await asyncio.wait_for(ws.started.wait(), timeout=2.0)
+        if abort_first:
+            transport.abort()
+            await asyncio.wait_for(ws.closed.wait(), timeout=2.0)
+        assert await asyncio.wait_for(progress, timeout=2.0) is False
+        await asyncio.wait_for(ws.closed.wait(), timeout=2.0)
+        transport.abort()
+        await asyncio.sleep(0)  # drain any close scheduled by the second failure signal
+        assert ws.closed_with == [1011]
+        assert transport.closed
+        assert not await transport.write_async({"id": "later"})
 
     asyncio.run(_run())
 
