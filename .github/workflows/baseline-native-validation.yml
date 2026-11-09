@@ -1,0 +1,28 @@
+# HH466 validation evidence only: preserve this branch; never merge or deploy it.
+name: Baseline native Linux qualification
+
+on:
+  push:
+    branches: [ms/fix/HH-466-final-native-linux-validation]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: baseline-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  canonical-tests:
+    uses: ./.github/workflows/tests.yml
+    with:
+      # Exact reviewed candidate; workflow configuration lives on this validation branch.
+      commit: 'ac457fdac35a941b301a6d7c62080ef4c0474d1c'
+      test_runner: ubuntu-24.04
+      test_workers: 4
+      # Allow cold dependency setup and slower hosted CPUs within a bounded job.
+      # Exhaustion is failed qualification requiring investigation, not proof
+      # that the tested source introduced a regression.
+      test_timeout_minutes: 180
+      e2e: false
+      e2e_upgrade: false
