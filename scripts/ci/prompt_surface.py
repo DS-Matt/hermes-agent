@@ -17,7 +17,8 @@ both through the production code into ``tests/fixtures/prompt_surface/``, which 
 
 ``render`` runs in a throwaway ``HERMES_HOME`` (stock config, bundled skills synced) with the clock,
 host OS, network, tool availability and machine paths pinned, so a laptop and the CI runner produce
-the same bytes. ``diff`` is stdlib-only: the PR job runs it on two snapshot directories.
+the same bytes on Linux and macOS. Linux is the canonical render host; native Windows
+byte parity is not qualified. ``diff`` is stdlib-only: the PR job runs it on two snapshot directories.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import sys
 import tempfile
 from collections import Counter
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -79,7 +81,11 @@ def _pin_environment() -> None:
     socket.socket.connect = refuse  # type: ignore[method-assign]
     socket.create_connection = refuse  # type: ignore[assignment]
     socket.getaddrinfo = refuse  # type: ignore[assignment]
-    sys.platform = "linux"  # skills index ``platforms:`` gate
+    # Pin skill eligibility before prompt_builder binds this predicate; keep the host OS real.
+    from agent import skill_utils
+    skill_utils.skill_matches_platform_list = partial(
+        skill_utils.skill_matches_platform_list, current_platform="linux",
+    )
 
     import hermes_time
     hermes_time.now = lambda: FIXED_NOW  # type: ignore[assignment]
@@ -87,7 +93,6 @@ def _pin_environment() -> None:
     # read credentials, binaries and the tool store, which vary by host and would hide schemas.
     import tools.registry as registry_module
     registry_module._check_fn_cached = lambda _fn: True  # type: ignore[assignment]
-    from agent import skill_utils
     skill_utils._ENV_DETECT_CACHE.update({"docker": False, "s6": False})
     # The toolchain probe line reports the host's python/node/pip; it is environment, not code.
     from tools import env_probe
@@ -111,6 +116,7 @@ def _scrub(text: str, home: Path) -> str:
         str(home / ".hermes"): "<HERMES_HOME>",
         str(home): "<HOME>",
         f"{_platform.system()} ({_platform.release()})": "<HOST_OS>",
+        f"macOS ({_platform.mac_ver()[0] or _platform.release()})": "<HOST_OS>",
     }.items(), key=lambda kv: -len(kv[0])):
         text = text.replace(raw, token)
     return text
@@ -198,7 +204,7 @@ def render(out: Path) -> int:
     """Render into *out* from a fresh child process and home, so nothing from the caller's
     environment, config or imported modules reaches the bytes."""
     with tempfile.TemporaryDirectory(prefix="prompt-surface-") as tmp:
-        home = Path(tmp) / "home"
+        home = Path(tmp).resolve() / "home"
         home.mkdir()
         staging = Path(tmp) / "out"
         env = {
