@@ -454,6 +454,8 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
     # ``hermes_bootstrap`` right after the repair (``_PIN_DEFAULT_HOME``), and here again for a
     # bootstrap that predates that hook.
     root = str(repo_root.resolve())
+    bootstrap_path = str(Path(root) / "hermes_bootstrap.py")
+    missing_bootstrap = f"hermes: missing owned bootstrap: {bootstrap_path}"
     from hermes_cli._early_recovery import (
         INTERRUPTED_PULL_MARKER,
         RECOVERY_CLOSURE,
@@ -489,6 +491,9 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
         "        _early_recovery = None  # a tree without the repair: the imports below report real damage\n"
         f"    if _early_recovery is not None and _early_recovery.restore_interrupted_pull(Path({root!r})):\n"
         "        _early_recovery.relaunch_after_restore()\n"
+        f"    if not os.path.isfile({bootstrap_path!r}):\n"
+        "        _hermes_closure_repair()\n"
+        f"        sys.exit({missing_bootstrap!r})\n"
         "    from hermes_constants import get_default_hermes_root\n"
         "    os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(get_default_hermes_root())\n"
         "    from hermes_cli._launchers import print_runtime_command\n"
@@ -496,6 +501,8 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
         "    sys.exit(0)\n"
         f"sys.{PIN_DEFAULT_HOME_FLAG} = True\n"
         "try:\n"
+        f"    if not os.path.isfile({bootstrap_path!r}):\n"
+        f"        raise ModuleNotFoundError({missing_bootstrap!r})\n"
         "    import hermes_bootstrap\n"
         "except Exception:\n"
         "    _hermes_closure_repair()\n"
