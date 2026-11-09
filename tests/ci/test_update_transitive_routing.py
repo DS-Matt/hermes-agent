@@ -9,12 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from tests.ci.test_update_ci_routing import _REPO, _ci_run, _consumers_reached, _real_classifier
+from tests.ci.test_update_ci_routing import _EMULATED_BASH, _REPO, _ci_run, _consumers_reached, _real_classifier
 
 
 # bounded_probe_run -> spawn_server, kill_process_tree -> deadline; the
 # remaining edges are migrate_all_homes' provider/profile/install decisions.
 # backup is the update transaction's pre-build step, not a build dependency.
+@pytest.mark.platforms("linux", "windows")
+@_EMULATED_BASH
 @pytest.mark.parametrize("path", [
     "hermes_cli/local_runtime/processes.py",
     # Importing processes runs the package init: v2026.9.24's update died there on a name
