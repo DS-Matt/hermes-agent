@@ -1,6 +1,7 @@
 """Tests for check_all_command_guards() — the combined floor + dangerous-command guard."""
 
 import os
+import shlex
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -75,10 +76,11 @@ class TestCliPrompt:
         assert result["approved"] is True
         cb.assert_not_called()
 
-    def test_dangerous_command_deny(self):
+    def test_dangerous_command_deny(self, tmp_path):
         os.environ["HERMES_INTERACTIVE"] = "1"
         cb = MagicMock(return_value="deny")
-        result = check_all_command_guards("rm -rf /tmp", "local", approval_callback=cb)
+        result = check_all_command_guards(f"rm -rf {shlex.quote(str(tmp_path / 'disposable'))}",
+                                          "local", approval_callback=cb)
         assert result["approved"] is False
         cb.assert_called_once()
         assert cb.call_args[1]["allow_permanent"] is True
